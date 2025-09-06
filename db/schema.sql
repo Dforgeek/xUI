@@ -24,6 +24,12 @@ create table question
 );
 create index question_block_id_idx on question (block_id);
 
+create table survey_preset
+(
+    id bigserial primary key,
+    questions bigint[] not null
+);
+
 create table survey
 (
     id bigserial primary key,
