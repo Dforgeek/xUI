@@ -1,7 +1,7 @@
 version: "3.9"
 
 services:
-  postgres:
+  db:
     image: postgres:16-alpine
     container_name: pg16
     environment:
@@ -12,12 +12,21 @@ services:
       - "5432:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
-      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 3s
       retries: 20
+  
+  api:
+    build: ./back
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@db:5432/app   # 👈 host = db
+    depends_on:
+      db:
+        condition: service_healthy
+    ports: ["8000:8000"]
 
 volumes:
   db-data: {}

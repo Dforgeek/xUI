@@ -7,6 +7,7 @@ from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+import os
 
 from sqlalchemy import (
     BigInteger, SmallInteger, String, Text, ARRAY, Integer, ForeignKey,
@@ -20,7 +21,7 @@ from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
 # =========================
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql+asyncpg://app:app@localhost:5432/app"
+    DATABASE_URL: str = os.getenv("DATABASE_URL")
     CORS_ALLOW_ORIGINS: List[str] = ["*"]
 
 settings = Settings()
