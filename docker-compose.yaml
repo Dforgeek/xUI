@@ -22,7 +22,7 @@ services:
   api:
     build: ./back
     environment:
-      DATABASE_URL: postgresql+asyncpg://app:app@db:5432/app   # 👈 host = db
+      DATABASE_URL: postgresql+asyncpg://app:app@db:5432/app
     depends_on:
       db:
         condition: service_healthy

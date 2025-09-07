@@ -15,6 +15,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
+from sqlalchemy import update
 
 # =========================
 # Settings
@@ -198,6 +199,34 @@ class SurveyAggregateOut(BaseModel):
     total_respondents: int
     responded: int
     by_question: List[QuestionAggregate]
+
+class BulkAnswerItem(BaseModel):
+    question_id: int
+    answer: str
+
+class BulkAnswersIn(BaseModel):
+    user_id: int
+    answers: List[BulkAnswerItem]
+
+class SurveyInfoOut(BaseModel):
+    subject_user_id: int
+    created_at: datetime
+    deadline: datetime
+    anonymous: bool
+    review_type: ReviewType
+    preset_label: Optional[str] = None
+
+class QuestionFormItem(BaseModel):
+    question_id: int
+    question_text: str
+    question_type: int
+    answer_fields: str
+
+class SurveyFormOut(BaseModel):
+    user_id: int
+    survey_id: int
+    survey_info: SurveyInfoOut
+    questions: List[QuestionFormItem]
 
 # =========================
 # App
@@ -462,109 +491,154 @@ async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(
         preset_label=payload.preset_label
     )
 
-@app.get("/surveys/by-subject/{user_id}", response_model=List[SurveyListItem])
-async def list_surveys_by_subject(user_id: int, db: AsyncSession = Depends(get_session)):
-    # fetch surveys
-    res = await db.execute(select(Survey).where(Survey.subject_user_id == user_id).order_by(Survey.created_at.desc()))
-    surveys = res.scalars().all()
-    out: List[SurveyListItem] = []
-    for s in surveys:
-        # participants
-        cnt_participants = await db.scalar(select(func.count()).select_from(SurveyRespondent).where(SurveyRespondent.survey_id == s.id))
-        # who are they
-        reviewers_res = await db.execute(select(SurveyRespondent.user_id).where(SurveyRespondent.survey_id == s.id))
-        reviewer_ids = [r[0] for r in reviewers_res.all()]
-        # completed: считаем «ответившим» тех, у кого есть хотя бы один ответ
-        resp_count = await db.scalar(
-            select(func.count(func.distinct(SurveyAnswer.user_id)))
-            .where(SurveyAnswer.survey_id == s.id)
-        )
-        status_str: Literal["pending", "in_progress", "completed"]
-        if resp_count == 0:
-            status_str = "pending"
-        elif resp_count < cnt_participants:
-            status_str = "in_progress"
-        else:
-            status_str = "completed"
-        out.append(SurveyListItem(
-            id=s.id, created_at=s.created_at, deadline=s.deadline,
-            participants_count=cnt_participants, completed_count=resp_count,
-            status=status_str, reviewer_user_ids=reviewer_ids
-        ))
-    return out
+@app.post("/surveys/{survey_id}/answers/bulk", status_code=201)
+async def submit_answers_bulk(
+    survey_id: int,
+    payload: BulkAnswersIn,
+    db: AsyncSession = Depends(get_session)
+):
+    # базовая валидация входных данных
+    if not payload.answers:
+        raise HTTPException(400, "answers must be a non-empty list")
 
-@app.post("/surveys/{survey_id}/answers", status_code=201)
-async def submit_answer(survey_id: int, payload: AnswerIn, db: AsyncSession = Depends(get_session)):
-    # validate respondent belongs to survey
+    # проверка, что пользователь — респондент данного опроса
     belongs = await db.scalar(
-        select(func.count()).select_from(SurveyRespondent)
-        .where(and_(SurveyRespondent.survey_id == survey_id, SurveyRespondent.user_id == payload.user_id))
+        select(func.count())
+        .select_from(SurveyRespondent)
+        .where(
+            and_(
+                SurveyRespondent.survey_id == survey_id,
+                SurveyRespondent.user_id == payload.user_id
+            )
+        )
     )
     if not belongs:
         raise HTTPException(400, "User is not a respondent of this survey")
-    # validate question belongs to survey
-    q_ok = await db.scalar(
-        select(func.count()).select_from(SurveyQuestion)
-        .where(and_(SurveyQuestion.survey_id == survey_id, SurveyQuestion.question_id == payload.question_id))
-    )
-    if not q_ok:
-        raise HTTPException(400, "Question is not part of this survey")
-    db.add(SurveyAnswer(survey_id=survey_id, user_id=payload.user_id,
-                        question_id=payload.question_id, answer=payload.answer))
-    await db.commit()
-    return {"ok": True}
 
-@app.get("/surveys/{survey_id}/aggregate", response_model=SurveyAggregateOut)
-async def aggregate_survey(survey_id: int, db: AsyncSession = Depends(get_session)):
-    # meta
+    # собрать список вопросів из payload
+    qids = [a.question_id for a in payload.answers]
+
+    # проверить, что ВСЕ эти вопросы входят в опрос
+    count_q = await db.scalar(
+        select(func.count())
+        .select_from(SurveyQuestion)
+        .where(
+            and_(
+                SurveyQuestion.survey_id == survey_id,
+                SurveyQuestion.question_id.in_(qids)
+            )
+        )
+    )
+    if count_q != len(qids):
+        raise HTTPException(400, "Some question_id do not belong to this survey")
+
+    # вытащить уже существующие ответы пользователя по этим вопросам
+    existing_res = await db.execute(
+        select(SurveyAnswer)
+        .where(
+            and_(
+                SurveyAnswer.survey_id == survey_id,
+                SurveyAnswer.user_id == payload.user_id,
+                SurveyAnswer.question_id.in_(qids)
+            )
+        )
+    )
+    existing = { (row.question_id): row for row in existing_res.scalars().all() }
+
+    created_cnt = 0
+    updated_cnt = 0
+
+    # апсерт: обновить существующие, вставить новые
+    for item in payload.answers:
+        if item.question_id in existing:
+            # обновляем текст ответа
+            obj = existing[item.question_id]
+            obj.answer = item.answer
+            updated_cnt += 1
+        else:
+            db.add(SurveyAnswer(
+                survey_id=survey_id,
+                user_id=payload.user_id,
+                question_id=item.question_id,
+                answer=item.answer
+            ))
+            created_cnt += 1
+
+    await db.commit()
+    return {"ok": True, "created": created_cnt, "updated": updated_cnt}
+
+# =========================
+# Survey form (questions for a respondent)
+# =========================
+
+@app.get("/surveys/{survey_id}/form", response_model=SurveyFormOut)
+async def get_survey_form(
+    survey_id: int,
+    user_id: int = Query(..., description="ID пользователя-респондента"),
+    db: AsyncSession = Depends(get_session)
+):
+    # проверка, что опрос существует (через SurveyMeta получим метаданные)
     meta = await db.scalar(select(SurveyMeta).where(SurveyMeta.survey_id == survey_id))
     if not meta:
         raise HTTPException(404, "Survey not found")
-    anonymous = bool(meta.data.get("anonymous", False))
-    review_type: ReviewType = meta.data.get("review_type", "180")  # type: ignore
 
-    # counts
-    total_resp = await db.scalar(select(func.count()).select_from(SurveyRespondent).where(SurveyRespondent.survey_id == survey_id))
-    responded = await db.scalar(select(func.count(func.distinct(SurveyAnswer.user_id))).where(SurveyAnswer.survey_id == survey_id))
+    # проверка, что пользователь — респондент данного опроса
+    belongs = await db.scalar(
+        select(func.count())
+        .select_from(SurveyRespondent)
+        .where(
+            and_(
+                SurveyRespondent.survey_id == survey_id,
+                SurveyRespondent.user_id == user_id
+            )
+        )
+    )
+    if not belongs:
+        raise HTTPException(403, "User is not a respondent of this survey")
 
-    # questions
+    # основной объект опроса
+    survey = await db.scalar(select(Survey).where(Survey.id == survey_id))
+    if not survey:
+        raise HTTPException(404, "Survey not found")
+
+    # вопросы, входящие в опрос
     q_res = await db.execute(
-        select(Question.id, Question.question_text)
+        select(
+            Question.id,
+            Question.question_text,
+            Question.question_type,
+            Question.answer_fields
+        )
         .join(SurveyQuestion, SurveyQuestion.question_id == Question.id)
         .where(SurveyQuestion.survey_id == survey_id)
         .order_by(Question.id)
     )
-    q_map = {qid: qtext for qid, qtext in q_res.all()}
-
-    # answers grouped by question
-    a_res = await db.execute(
-        select(SurveyAnswer.question_id, SurveyAnswer.user_id, SurveyAnswer.answer)
-        .where(SurveyAnswer.survey_id == survey_id)
-        .order_by(SurveyAnswer.question_id, SurveyAnswer.user_id)
-    )
-    by_q: Dict[int, List[Dict[str, Any]]] = {}
-    for qid, uid, ans in a_res.all():
-        item = {"answer": ans}
-        if not anonymous:
-            item["user_id"] = uid
-        by_q.setdefault(qid, []).append(item)
-
-    agg = []
-    for qid, qtext in q_map.items():
-        agg.append(QuestionAggregate(
+    questions = [
+        QuestionFormItem(
             question_id=qid,
             question_text=qtext,
-            answers=by_q.get(qid, [])
-        ))
+            question_type=qtype,
+            answer_fields=afields
+        )
+        for (qid, qtext, qtype, afields) in q_res.all()
+    ]
 
-    return SurveyAggregateOut(
-        survey_id=survey_id,
-        anonymous=anonymous,
-        review_type=review_type,
-        total_respondents=total_resp or 0,
-        responded=responded or 0,
-        by_question=agg
+    survey_info = SurveyInfoOut(
+        subject_user_id=survey.subject_user_id,
+        created_at=survey.created_at,
+        deadline=survey.deadline,
+        anonymous=bool(meta.data.get("anonymous", False)),
+        review_type=meta.data.get("review_type", "180"),   # type: ignore
+        preset_label=meta.data.get("preset_label"),
     )
+
+    return SurveyFormOut(
+        user_id=user_id,
+        survey_id=survey_id,
+        survey_info=survey_info,
+        questions=questions
+    )
+
 
 # =========================
 # Health
