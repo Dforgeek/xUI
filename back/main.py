@@ -11,7 +11,7 @@ import os
 
 from sqlalchemy import (
     BigInteger, SmallInteger, String, Text, ARRAY, Integer, ForeignKey,
-    Index, UniqueConstraint, select, func, and_, literal_column
+    Index, UniqueConstraint, select, func, and_, literal_column, Boolean
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
@@ -68,6 +68,9 @@ class Survey(Base):
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     deadline: Mapped[datetime] = mapped_column(nullable=False)
     notifications_before: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    anonymous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    review_type: Mapped[str] = mapped_column(String(10), nullable=False)          # "180" | "360"
     # расширенная настройка анонимности — добавим виртуально через API/метаданные, не меняя схему:
     # хранить будем в отдельной таблице-псевдонастройке, чтобы не ломать вашу схему
     # но чтобы сохранить строго вашу схему — положим флаг в notifications_before старшим битом.
@@ -94,14 +97,6 @@ class SurveyAnswer(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     question_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     answer: Mapped[str] = mapped_column(Text, nullable=False)
-
-# Небольшая вспомогательная таблица для метаданных опроса (анонимность, тип 180/360, имя пресета)
-from sqlalchemy import JSON
-class SurveyMeta(Base):
-    __tablename__ = "survey_meta"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    survey_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("survey.id"), nullable=False, unique=True, index=True)
-    data: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
 # =========================
 # Engine / Session
@@ -153,13 +148,10 @@ class InitiateSurveyIn(BaseModel):
     subject_user_id: int
     reviewer_user_ids: List[int] = Field(default_factory=list, description="включая коллег и руководителя; для 360 самооценка добавится автоматически")
     review_type: ReviewType
-    preset_id: Optional[int] = None
-    selected_block_ids: Optional[List[int]] = None
-    additional_question_ids: Optional[List[int]] = None
+    question_ids: Optional[List[int]] = None
     deadline: datetime
     notifications_before: int = 0
     anonymous: bool = False
-    preset_label: Optional[str] = None  # чтобы понимать какой пресет использовали (для отчётов)
 
 class SurveyOut(BaseModel):
     id: int
@@ -171,7 +163,6 @@ class SurveyOut(BaseModel):
     review_type: ReviewType
     participants_count: int
     questions_count: int
-    preset_label: Optional[str] = None
 
 class SurveyListItem(BaseModel):
     id: int
@@ -214,7 +205,6 @@ class SurveyInfoOut(BaseModel):
     deadline: datetime
     anonymous: bool
     review_type: ReviewType
-    preset_label: Optional[str] = None
 
 class QuestionFormItem(BaseModel):
     question_id: int
@@ -429,28 +419,57 @@ async def build_question_ids(
         raise HTTPException(400, "No questions selected")
     return ordered
 
+
 @app.post("/surveys/initiate", response_model=SurveyOut, status_code=201)
 async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(get_session)):
     # validate subject
-    subj_exists = await db.scalar(select(func.count()).select_from(UserInfo).where(UserInfo.id == payload.subject_user_id))
+    subj_exists = await db.scalar(
+        select(func.count())
+        .select_from(UserInfo)
+        .where(UserInfo.id == payload.subject_user_id)
+    )
     if not subj_exists:
         raise HTTPException(400, "subject_user_id not found")
 
     # validate reviewers
     if payload.reviewer_user_ids:
-        count = await db.scalar(select(func.count()).select_from(UserInfo).where(UserInfo.id.in_(payload.reviewer_user_ids)))
+        count = await db.scalar(
+            select(func.count())
+            .select_from(UserInfo)
+            .where(UserInfo.id.in_(payload.reviewer_user_ids))
+        )
         if count != len(payload.reviewer_user_ids):
             raise HTTPException(400, "Some reviewer_user_ids do not exist")
 
-    # build questions
-    question_ids = await build_question_ids(db, payload.preset_id, payload.selected_block_ids, payload.additional_question_ids)
+    # validate & normalize questions
+    if not payload.question_ids:
+        raise HTTPException(400, "No questions selected")
 
+    seen: set[int] = set()
+    question_ids: List[int] = []
+    for qid in payload.question_ids:
+        if qid not in seen:
+            seen.add(qid)
+            question_ids.append(qid)
+
+    # ensure all questions exist
+    q_count = await db.scalar(
+        select(func.count())
+        .select_from(Question)
+        .where(Question.id.in_(question_ids))
+    )
+    if q_count != len(question_ids):
+        raise HTTPException(400, "Some question_ids do not exist")
+
+    # create survey (мета напрямую в Survey)
     now = datetime.now(timezone.utc)
     survey = Survey(
         subject_user_id=payload.subject_user_id,
         created_at=now,
         deadline=payload.deadline,
         notifications_before=payload.notifications_before,
+        anonymous=payload.anonymous,
+        review_type=payload.review_type
     )
     db.add(survey)
     await db.flush()  # get survey.id
@@ -464,17 +483,6 @@ async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(
         respondents.add(payload.subject_user_id)
     db.add_all([SurveyRespondent(survey_id=survey.id, user_id=uid) for uid in respondents])
 
-    # meta
-    meta = {
-        "anonymous": payload.anonymous,
-        "review_type": payload.review_type,
-        "preset_label": payload.preset_label,
-        "preset_id": payload.preset_id,
-        "selected_block_ids": payload.selected_block_ids or [],
-        "additional_question_ids": payload.additional_question_ids or [],
-    }
-    db.add(SurveyMeta(survey_id=survey.id, data=meta))
-
     await db.commit()
     await db.refresh(survey)
 
@@ -484,12 +492,12 @@ async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(
         created_at=survey.created_at,
         deadline=survey.deadline,
         notifications_before=survey.notifications_before,
-        anonymous=payload.anonymous,
+        anonymous=survey.anonymous,
         review_type=payload.review_type,
         participants_count=len(respondents),
         questions_count=len(question_ids),
-        preset_label=payload.preset_label
     )
+
 
 @app.post("/surveys/{survey_id}/answers/bulk", status_code=201)
 async def submit_answers_bulk(
@@ -567,22 +575,18 @@ async def submit_answers_bulk(
     await db.commit()
     return {"ok": True, "created": created_cnt, "updated": updated_cnt}
 
-# =========================
-# Survey form (questions for a respondent)
-# =========================
-
 @app.get("/surveys/{survey_id}/form", response_model=SurveyFormOut)
 async def get_survey_form(
     survey_id: int,
     user_id: int = Query(..., description="ID пользователя-респондента"),
     db: AsyncSession = Depends(get_session)
 ):
-    # проверка, что опрос существует (через SurveyMeta получим метаданные)
-    meta = await db.scalar(select(SurveyMeta).where(SurveyMeta.survey_id == survey_id))
-    if not meta:
+    # основной объект опроса
+    survey = await db.scalar(select(Survey).where(Survey.id == survey_id))
+    if not survey:
         raise HTTPException(404, "Survey not found")
 
-    # проверка, что пользователь — респондент данного опроса
+    # проверка респондента
     belongs = await db.scalar(
         select(func.count())
         .select_from(SurveyRespondent)
@@ -596,12 +600,7 @@ async def get_survey_form(
     if not belongs:
         raise HTTPException(403, "User is not a respondent of this survey")
 
-    # основной объект опроса
-    survey = await db.scalar(select(Survey).where(Survey.id == survey_id))
-    if not survey:
-        raise HTTPException(404, "Survey not found")
-
-    # вопросы, входящие в опрос
+    # вопросы
     q_res = await db.execute(
         select(
             Question.id,
@@ -627,9 +626,8 @@ async def get_survey_form(
         subject_user_id=survey.subject_user_id,
         created_at=survey.created_at,
         deadline=survey.deadline,
-        anonymous=bool(meta.data.get("anonymous", False)),
-        review_type=meta.data.get("review_type", "180"),   # type: ignore
-        preset_label=meta.data.get("preset_label"),
+        anonymous=survey.anonymous,
+        review_type=survey.review_type,   # type: ignore
     )
 
     return SurveyFormOut(
@@ -638,6 +636,7 @@ async def get_survey_form(
         survey_info=survey_info,
         questions=questions
     )
+
 
 
 # =========================

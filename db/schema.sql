@@ -36,7 +36,9 @@ create table survey
     subject_user_id bigint not null,
     created_at timestamp with time zone not null,
     deadline timestamp with time zone not null,
-    notifications_before bigint not null
+    notifications_before bigint not null,
+    anonymous boolean NOT NULL DEFAULT false,
+    review_type varchar(10) NOT NULL DEFAULT '180'
 );
 
 create table survey_question
