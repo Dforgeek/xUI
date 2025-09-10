@@ -5,13 +5,13 @@ from typing import List, Optional, Literal, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
 from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 import os
 
 from sqlalchemy import (
     BigInteger, SmallInteger, String, Text, ARRAY, Integer, ForeignKey,
-    Index, UniqueConstraint, select, func, and_, literal_column, Boolean
+    Index, UniqueConstraint, select, func, and_, literal_column, Boolean, DateTime
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
@@ -41,62 +41,156 @@ class UserInfo(Base):
     post: Mapped[int] = mapped_column(Integer, nullable=False)
     command_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
 
+    # subject of surveys (FK: Survey.subject_user_id)
+    surveys_subject: Mapped[list["Survey"]] = relationship(
+        back_populates="subject_user",
+        foreign_keys=lambda: [Survey.subject_user_id],
+        cascade="all,delete",
+        passive_deletes=True,
+    )
+
+    # MISSING IN YOUR TRACE → add this:
+    survey_responses: Mapped[list["SurveyRespondent"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    # optional but recommended if you relate answers to users
+    answers: Mapped[list["SurveyAnswer"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 class Block(Base):
     __tablename__ = "block"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    block_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    block_name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+
+    questions: Mapped[list["Question"]] = relationship(
+        back_populates="block", cascade="all, delete-orphan", passive_deletes=True
+    )
+
 
 class Question(Base):
     __tablename__ = "question"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    block_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("block.id"), nullable=False, index=True)
+    block_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("block.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
     question_type: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     answer_fields: Mapped[str] = mapped_column(Text, nullable=False)
 
-    block: Mapped[Block] = relationship()
+    block: Mapped[Block] = relationship(back_populates="questions")
+    in_surveys: Mapped[list["SurveyQuestion"]] = relationship(
+        back_populates="question", cascade="all,delete", passive_deletes=True
+    )
+    answers: Mapped[list["SurveyAnswer"]] = relationship(
+        back_populates="question", cascade="all,delete", passive_deletes=True
+    )
 
 class SurveyPreset(Base):
     __tablename__ = "survey_preset"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    questions: Mapped[List[int]] = mapped_column(ARRAY(BigInteger), nullable=False)
+    questions: Mapped[list[int]] = mapped_column(ARRAY(BigInteger), nullable=False)
 
 class Survey(Base):
     __tablename__ = "survey"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    subject_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    deadline: Mapped[datetime] = mapped_column(nullable=False)
-    notifications_before: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
+    subject_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("user_info.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deadline:   Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    notifications_before: Mapped[int] = mapped_column(BigInteger, nullable=False)
     anonymous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    review_type: Mapped[str] = mapped_column(String(10), nullable=False)          # "180" | "360"
-    # расширенная настройка анонимности — добавим виртуально через API/метаданные, не меняя схему:
-    # хранить будем в отдельной таблице-псевдонастройке, чтобы не ломать вашу схему
-    # но чтобы сохранить строго вашу схему — положим флаг в notifications_before старшим битом.
-    # Ниже реализуем хранение флага в таблице survey_meta.
+    review_type: Mapped[str] = mapped_column(String(10), nullable=False)
+
+    subject_user: Mapped["UserInfo"] = relationship(
+        back_populates="surveys_subject",
+        foreign_keys=[subject_user_id],
+    )
+
+    respondents: Mapped[list["SurveyRespondent"]] = relationship(
+        back_populates="survey",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    answers: Mapped[list["SurveyAnswer"]] = relationship(
+        back_populates="survey",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    # NEW: reverse side for SurveyQuestion.survey(back_populates="questions")
+    questions: Mapped[list["SurveyQuestion"]] = relationship(
+        back_populates="survey",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
 
 class SurveyQuestion(Base):
     __tablename__ = "survey_question"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    question_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    survey_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    __table_args__ = (UniqueConstraint("question_id", "survey_id", name="survey_question_survey_id_question_id_idx"),)
+    question_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("question.id", ondelete="CASCADE"), nullable=False
+    )
+    survey_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
+    )
+    __table_args__ = (
+        UniqueConstraint("question_id", "survey_id", name="survey_question_survey_id_question_id_idx"),
+    )
+
+    survey: Mapped[Survey] = relationship(back_populates="questions")
+    question: Mapped[Question] = relationship(back_populates="in_surveys")
 
 class SurveyRespondent(Base):
     __tablename__ = "survey_respondent"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    survey_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    __table_args__ = (UniqueConstraint("user_id", "survey_id", name="survey_respondent_user_id_survey_id_idx"),)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("user_info.id", ondelete="CASCADE"), nullable=False
+    )
+    survey_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
+    )
+    __table_args__ = (
+        UniqueConstraint("user_id", "survey_id", name="survey_respondent_user_id_survey_id_idx"),
+    )
+
+    survey: Mapped["Survey"] = relationship(back_populates="respondents")
+    # This expects UserInfo.survey_responses to exist:
+    user: Mapped["UserInfo"] = relationship(back_populates="survey_responses")
 
 class SurveyAnswer(Base):
     __tablename__ = "survey_answer"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    survey_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    question_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    survey_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("survey.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("user_info.id", ondelete="CASCADE"), nullable=False
+    )
+    question_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("question.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     answer: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("survey_id", "user_id", "question_id", name="uq_answer_triplet"),
+        Index("ix_answer_survey_q", "survey_id", "question_id"),
+    )
+
+    survey: Mapped["Survey"] = relationship(back_populates="answers")
+    user:   Mapped["UserInfo"] = relationship(back_populates="answers")
+    question: Mapped["Question"] = relationship(back_populates="answers")
 
 # =========================
 # Engine / Session
@@ -146,12 +240,23 @@ ReviewType = Literal["180", "360"]
 
 class InitiateSurveyIn(BaseModel):
     subject_user_id: int
-    reviewer_user_ids: List[int] = Field(default_factory=list, description="включая коллег и руководителя; для 360 самооценка добавится автоматически")
+    reviewer_user_ids: List[int] = Field(
+        default_factory=list,
+        description="включая коллег и руководителя; для 360 самооценка добавится автоматически",
+    )
     review_type: ReviewType
     question_ids: Optional[List[int]] = None
     deadline: datetime
     notifications_before: int = 0
     anonymous: bool = False
+
+    @field_validator("deadline")
+    @classmethod
+    def ensure_deadline_tz(cls, v: datetime) -> datetime:
+        # Convert naive datetimes to UTC to match timestamptz columns
+        if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
 
 class SurveyOut(BaseModel):
     id: int
@@ -644,4 +749,11 @@ async def get_survey_form(
 # =========================
 @app.get("/healthz")
 async def health():
+    from sqlalchemy.dialects import postgresql
+    print("created_at tz? ->", Survey.__table__.c.created_at.type.timezone)  # should print True
+    print("deadline   tz? ->", Survey.__table__.c.deadline.type.timezone)    # should print True
+
+    # Optional: see compiled DML cast
+    from sqlalchemy import insert
+    print(insert(Survey).compile(dialect=postgresql.dialect()))
     return {"status": "ok"}
