@@ -154,6 +154,7 @@ class BlockBase(BaseModel):
     type: str
     name: str
     optional: bool = False
+    answerText: Optional[str] = None
 
 class BlockProfile(BlockBase):
     type: Literal["profile"] = "profile"
@@ -355,6 +356,7 @@ async def get_survey_by_link_token(
     db: AsyncSession = Depends(get_session),
 ):
     link, survey, subject, respondent = await _load_linked_context(db, linkToken)
+
     now = _now_utc()
     if now > survey.deadline:
         raise HTTPException(410, "Survey deadline has passed")
@@ -366,6 +368,27 @@ async def get_survey_by_link_token(
 
     blocks = await _build_blocks(db, survey.id)
     title = survey.title or (f"{survey.review_type.upper()} Engineering 360" if survey.review_type else "360 Survey")
+
+    # Новое: подставляем текст уже данных ответов прямо в блоки
+    existing = await db.scalar(
+        select(SurveyResponse).where(
+            and_(
+                SurveyResponse.survey_id == survey.id,
+                SurveyResponse.respondent_user_id == respondent.id,
+            )
+        )
+    )
+    if existing and existing.answers:
+        amap = dict(existing.answers)
+        for b in blocks:
+            raw = amap.get(b.id)
+            if raw is None:
+                continue
+            # Для rating кладём число как строку; для text — сам текст
+            if isinstance(b, BlockText):
+                b.answerText = raw
+            elif isinstance(b, BlockRating):
+                b.answerText = str(raw)
 
     return SurveyEnvelope(
         nowISO=_iso(now),
