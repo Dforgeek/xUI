@@ -1,2 +1,5 @@
 langchain==0.3.27
 langchain-deepseek==0.1.4
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic>=2.7.4
