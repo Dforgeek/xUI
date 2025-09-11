@@ -185,6 +185,9 @@ class SurveyEnvelope(BaseModel):
     nowISO: str
     isClosed: bool
     survey: SurveyOut
+    # NEW: present when a response already exists for this link
+    response: Optional[ExistingResponseOut] = None
+
 
 class ClientMeta(BaseModel):
     userAgent: Optional[str] = None
@@ -213,7 +216,12 @@ class ResponseUpdated(BaseModel):
     version: int
     
     
-    
+class ExistingResponseOut(BaseModel):
+    responseId: str
+    version: int
+    submittedAtISO: Optional[str] = None
+    updatedAtISO: Optional[str] = None
+    finalized: Optional[bool] = None
 # =========================
 # Surveys 
 # =========================
@@ -389,10 +397,21 @@ async def get_survey_by_link_token(
                 b.answerText = raw
             elif isinstance(b, BlockRating):
                 b.answerText = str(raw)
+        # NEW: if there is an existing response, expose its identifiers for PATCH
+    resp_meta: Optional[ExistingResponseOut] = None
+    if existing:
+        resp_meta = ExistingResponseOut(
+            responseId=f"rsp_{existing.id}",
+            version=int(existing.version),
+            submittedAtISO=_iso(existing.submitted_at) if existing.submitted_at else None,
+            updatedAtISO=_iso(existing.updated_at) if existing.updated_at else None,
+            finalized=bool(existing.finalized),
+        )
+
 
     return SurveyEnvelope(
         nowISO=_iso(now),
-        isClosed=False,
+        isClosed=False,  # you can keep raising 410 above if deadline passed
         survey=SurveyOut(
             surveyId=f"srv_{survey.id}",
             title=title,
@@ -411,7 +430,9 @@ async def get_survey_by_link_token(
             ),
             blocks=blocks,
         ),
+        response=resp_meta,  # NEW
     )
+
 
 @v1.post("/surveys/{surveyId}/responses", response_model=ResponseCreated, status_code=201, tags=["Responses"])
 async def create_response(
