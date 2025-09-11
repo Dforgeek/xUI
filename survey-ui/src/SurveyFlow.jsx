@@ -1,5 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+// === API config ===
+const API_BASE =
+  (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_BASE) ||
+  process.env.REACT_APP_API_BASE ||
+  "http://localhost:8000"; // adjust if different
+
+// Read link token from URL (?token=...)
+function readLinkTokenFromURL() {
+  try {
+    const sp = new URLSearchParams(window.location.search);
+    return sp.get("token") || sp.get("t") || null;
+  } catch { return null; }
+}
 
 /**
  * SurveyFlow — Single‑block‑per‑page survey UI
@@ -123,38 +136,50 @@ function isBlockValidForAnswers(b, answers) {
 }
 
 export default function SurveyFlow({
-  blocks = demoBlocks,
-  deadlineISO = demoDeadlineISO,
-  respondent = demoRespondent,
-  subject = demoSubject,
+  blocks: blocksProp = demoBlocks,
+  deadlineISO: deadlineISOProp = demoDeadlineISO,
+  respondent: respondentProp = demoRespondent,
+  subject: subjectProp = demoSubject,
+  apiBase = API_BASE,
+  linkToken: linkTokenProp = null,           // allow explicit prop, or URL param
 }) {
+  const linkToken = linkTokenProp ?? readLinkTokenFromURL();
   const [current, setCurrent] = useState(0);
   const [answers, setAnswers] = useState(() => {
     const raw = typeof window !== "undefined" ? localStorage.getItem(LS_KEY) : null;
     return raw ? JSON.parse(raw) : {};
   });
-  const [visited, setVisited] = useState(() => Array(blocks.length).fill(false));
+  const [visited, setVisited] = useState(() => Array(blocksProp.length).fill(false));
   const [submitted, setSubmitted] = useState(false);
+  const [server, setServer] = useState({ surveyId: null, responseId: null, version: null });
+  const [meta, setMeta] = useState({ loading: !!linkToken, error: null });
+  const [runtime, setRuntime] = useState({
+    deadlineISO: deadlineISOProp,
+    respondent: respondentProp,
+    subject: subjectProp,
+    blocks: blocksProp,
+  });
+  const startedAtRef = useRef(new Date()); // for client meta
 
   // Reset all local state and localStorage (re‑prefill profile)
   function resetAll() {
     try { if (typeof window !== 'undefined') localStorage.removeItem(LS_KEY); } catch {}
-    const prof = blocks.find((b) => b.type === "profile");
-    const base = prof ? { [prof.id]: { ...respondent } } : {};
+    const prof = runtime.blocks.find((b) => b.type === "profile");
+    const base = prof ? { [prof.id]: { ...runtime.respondent } } : {};
     setAnswers(base);
-    setVisited(Array(blocks.length).fill(false));
+    setVisited(Array(runtime.blocks.length).fill(false));
     setSubmitted(false);
     setCurrent(0);
   }
 
-  const dLeft = daysLeft(deadlineISO);
+  const dLeft = daysLeft(runtime.deadlineISO);
   const isClosed = Number.isFinite(dLeft) && dLeft <= 0;
 
   // Pre-fill profile answers once (read-only profile)
   useEffect(() => {
-    const prof = blocks.find((b) => b.type === "profile");
+    const prof = runtime.blocks.find((b) => b.type === "profile");
     if (prof && !answers[prof.id]) {
-      setAnswers((prev) => ({ ...prev, [prof.id]: { ...respondent } }));
+      setAnswers((prev) => ({ ...prev, [prof.id]: { ...runtime.respondent } }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -210,8 +235,66 @@ export default function SurveyFlow({
       }
     } catch {}
   }, []);
+  // Load envelope when we have a linkToken; otherwise stay in demo mode
+  useEffect(() => {
+    if (!linkToken) return;
+    let cancelled = false;
 
-  const block = blocks[current];
+    (async () => {
+      try {
+        setMeta((m) => ({ ...m, loading: true, error: null }));
+        const res = await fetch(`${apiBase}/v1/surveys/access/${linkToken}`);
+        if (!res.ok) {
+          // 410 = closed; 401 = bad token; bubble others
+          const text = await res.text().catch(() => "");
+          throw new Error(`${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
+        }
+        const env = await res.json();
+        const srv = env.survey;
+
+        // Prepend a synthetic 'profile' block for your UI (backend only sends q* blocks)
+        const profileBlock = {
+          id: "profile",
+          name: "Personal Information & Subject",
+          type: "profile",
+          requireContactAtLeastOne: true,
+        };
+
+        if (!cancelled) {
+          setServer({ surveyId: srv.surveyId, responseId: null, version: null });
+          setRuntime({
+            deadlineISO: srv.deadlineISO,
+            respondent: {
+              firstName: srv.respondent.firstName,
+              lastName:  srv.respondent.lastName,
+              email:     srv.respondent.email || "",
+              telegram:  srv.respondent.telegram || "",
+            },
+            subject: {
+              firstName: srv.subject.firstName,
+              lastName:  srv.subject.lastName,
+            },
+            blocks: [profileBlock, ...(srv.blocks || [])],
+          });
+          // Re-prefill profile with respondent from server
+          const base = { profile: { ...srv.respondent } };
+          setAnswers(base);
+          setVisited(Array((srv.blocks?.length ?? 0) + 1).fill(false));
+          setCurrent(0);
+          setSubmitted(false);
+        }
+      } catch (e) {
+        if (!cancelled) setMeta({ loading: false, error: e.message || String(e) });
+        return;
+      } finally {
+        if (!cancelled) setMeta((m) => ({ ...m, loading: false }));
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [linkToken, apiBase]);
+
+  const block = runtime.blocks[current];
 
   const isCurrentValid = () => isBlockValidForAnswers(block, answers);
 
@@ -222,11 +305,20 @@ export default function SurveyFlow({
 
   function handleNext() {
     if (isClosed) return;
-    if (current === blocks.length - 1) {
-      if (isCurrentValid()) setSubmitted(true);
-      return;
-    }
-    if (isCurrentValid()) setCurrent((i) => Math.min(blocks.length - 1, i + 1));
+      const last = current === runtime.blocks.length - 1;
+      if (last) {
+        if (!isCurrentValid()) return;
+        (async () => {
+          try {
+            await submitToAPI();
+            setSubmitted(true);
+          } catch (e) {
+            alert(String(e)); // replace with your toast
+          }
+        })();
+        return;
+      }
+   if (isCurrentValid()) setCurrent((i) => Math.min(runtime.blocks.length - 1, i + 1));
   }
 
   function jumpTo(index) {
@@ -237,16 +329,130 @@ export default function SurveyFlow({
   function setAnswer(id, value) {
     setAnswers((prev) => ({ ...prev, [id]: value }));
   }
+  
+
+  // APIIIIIII
+    function buildAnsweredMap() {
+    // Only send answerable blocks (skip 'profile'); omit truly empty/undefined
+    const out = {};
+    for (const b of runtime.blocks) {
+      if (b.type === "profile") continue;
+      const v = answers[b.id];
+      if (v === undefined) continue;     // omit unanswered
+      out[b.id] = v;
+    }
+    return out;
+  }
+
+  async function submitToAPI() {
+    if (!server.surveyId || !linkToken) return;
+
+    const client = {
+      userAgent: (typeof navigator !== "undefined" && navigator.userAgent) || "",
+      timezone:  (Intl.DateTimeFormat().resolvedOptions()?.timeZone) || "",
+      startedAtISO: startedAtRef.current?.toISOString(),
+      submittedAtISO: new Date().toISOString(),
+    };
+
+    const headers = { "Content-Type": "application/json", "X-Survey-Token": linkToken };
+
+    if (!server.responseId) {
+      // First submission → POST
+      const payload = { answers: buildAnsweredMap(), client };
+      const res = await fetch(`${apiBase}/v1/surveys/${server.surveyId}/responses`, {
+        method: "POST", headers, body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`Submit failed: ${res.status} ${res.statusText}${txt ? ` — ${txt}` : ""}`);
+      }
+      const data = await res.json(); // { responseId, version, ... }
+      setServer((s) => ({ ...s, responseId: data.responseId, version: data.version }));
+    } else {
+      // Subsequent edits → PATCH (only deltas, but here we can just resend map as delta)
+      const payload = { answersDelta: buildAnsweredMap(), client };
+      const res = await fetch(`${apiBase}/v1/surveys/${server.surveyId}/responses/${server.responseId}`, {
+        method: "PATCH", headers, body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`Update failed: ${res.status} ${res.statusText}${txt ? ` — ${txt}` : ""}`);
+      }
+      const data = await res.json(); // { version, ... }
+      setServer((s) => ({ ...s, version: data.version }));
+    }
+  }
+
+
+
+
 
   // Completion ratio for progress bar
   const completedCount = useMemo(
-    () => blocks.filter((b) => isBlockValidForAnswers(b, answers)).length,
+    () => runtime.blocks.filter((b) => isBlockValidForAnswers(b, answers)).length,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [answers, blocks]
+    [answers, runtime.blocks]
   );
-  const progress = Math.round((completedCount / blocks.length) * 100);
+  const progress = Math.round((completedCount / runtime.blocks.length) * 100);
 
+
+
+  if (!linkToken && !runtime?.blocks?.length) {
+  // No token AND no demo blocks → show picker
   return (
+    <div className="min-h-screen w-full grid place-items-center">
+      <div className="max-w-md w-full p-6 rounded-xl border border-white/20 bg-slate-900 text-white">
+        <h2 className="text-xl font-semibold mb-3">Open a survey</h2>
+        <p className="text-white/70 text-sm mb-4">
+          Add <code>?token=...</code> to the URL, or run demo mode.
+        </p>
+        <div className="flex gap-2">
+          <button
+            className="px-4 py-2 rounded-lg bg-white text-slate-900"
+            onClick={() => {
+              // force demo state
+              setRuntime({
+                deadlineISO: demoDeadlineISO,
+                respondent: demoRespondent,
+                subject: demoSubject,
+                blocks: demoBlocks,
+              });
+            }}
+          >
+            Run demo
+          </button>
+          <button
+            className="px-4 py-2 rounded-lg border border-white/30"
+            onClick={() => {
+              const t = prompt("Paste link token");
+              if (t) window.location.search = `?token=${encodeURIComponent(t)}`;
+            }}
+          >
+            Paste token…
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+  }
+    if (meta.loading) {
+    return (
+      <div className="min-h-screen w-full grid place-items-center">
+        <div className="text-white/70">Loading survey…</div>
+      </div>
+    );
+  }
+  if (meta.error) {
+    return (
+      <div className="min-h-screen w-full grid place-items-center">
+        <div className="max-w-lg text-center text-red-200">
+          Failed to load survey: {meta.error}
+        </div>
+      </div>
+    );
+  }
+  return (
+    
     <div className="min-h-screen w-full bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 flex items-center justify-center p-4">
       <div className="w-full max-w-3xl">
         <header className="mb-6">
@@ -270,11 +476,11 @@ export default function SurveyFlow({
                   "text-xs px-2.5 py-1 rounded-full border",
                   isClosed ? "border-red-300 text-red-300" : "border-white/30 text-white/70",
                 ].join(" ")}
-                title={new Date(deadlineISO).toLocaleString()}>
+                title={new Date(runtime.deadlineISO).toLocaleString()}>
                   {isClosed ? "Closed" : `${dLeft} day${Math.abs(dLeft) === 1 ? "" : "s"} left`}
                 </span>
               )}
-              <span className="text-sm text-white/60">{submitted ? `${blocks.length}/${blocks.length}` : `${current + 1}/${blocks.length}`}</span>
+              <span className="text-sm text-white/60">{submitted ? `${runtime.blocks.length}/${runtime.blocks.length}` : `${current + 1}/${runtime.blocks.length}`}</span>
             </div>
           </div>
 
@@ -288,7 +494,7 @@ export default function SurveyFlow({
 
           {/* Step chips */}
           <div className="mt-4 flex flex-wrap items-center gap-2">
-            {blocks.map((b, idx) => {
+            {runtime.blocks.map((b, idx) => {
               const isActive = !submitted && idx === current;
               const canClick = visited[idx] && !isClosed; // allow jump to any visited step
               const isDone = isBlockValidForAnswers(b, answers);
@@ -316,7 +522,7 @@ export default function SurveyFlow({
             {isClosed ? (
               <div className="text-center py-8">
                 <div className="text-2xl font-semibold text-white/90 mb-2">This survey is closed</div>
-                <div className="text-white/60">The deadline was {new Date(deadlineISO).toLocaleString()}.</div>
+                <div className="text-white/60">The deadline was {new Date(runtime.deadlineISO).toLocaleString()}.</div>
               </div>
             ) : (
               <AnimatePresence mode="wait" initial={false}>
@@ -331,7 +537,7 @@ export default function SurveyFlow({
                   >
                     <h2 className="text-xl font-medium text-white/90">Thanks! Here’s your submission:</h2>
                     <div className="space-y-4">
-                      {blocks.map((b) => (
+                      {runtime.blocks.map((b) => (
                         <div key={`rev-${b.id}`} className="rounded-xl border border-white/15 bg-white/5 p-4">
                           <div className="text-white/70 text-sm mb-1">{b.name}{b.optional ? ' · Optional' : ''}</div>
                           {b.type === "rating" && (
@@ -346,7 +552,7 @@ export default function SurveyFlow({
                               return (
                                 <div className="text-white/90 text-sm space-y-1">
                                   <div><span className="text-white/60">You:</span> {v.firstName || "—"} {v.lastName || ""} · {v.email || "—"} · {v.telegram ? `@${v.telegram}` : "—"}</div>
-                                  <div><span className="text-white/60">About:</span> {subject.firstName} {subject.lastName}</div>
+                                  <div><span className="text-white/60">About:</span> {runtime.subject.firstName} {runtime.subject.lastName}</div>
                                 </div>
                               );
                             })()
@@ -399,7 +605,7 @@ export default function SurveyFlow({
                     {block?.type === "profile" && (
                       <ProfileStep
                         value={answers[block.id]}
-                        subject={subject}
+                        subject={runtime.subject}
                       />
                     )}
 
@@ -429,7 +635,7 @@ export default function SurveyFlow({
                     <NavBar
                       disableBack={current === 0}
                       disableNext={!isCurrentValid()}
-                      isLast={current === blocks.length - 1}
+                      isLast={current === runtime.blocks.length - 1}
                       onBack={handleBack}
                       onNext={handleNext}
                     />

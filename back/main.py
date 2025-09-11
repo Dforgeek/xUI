@@ -1,10 +1,12 @@
 import enum
 from datetime import datetime, timezone
-from typing import List, Optional, Literal, Dict, Any
+from typing import List, Optional, Literal, Dict, Any, Set
 
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
 from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 import os
@@ -41,22 +43,23 @@ class UserInfo(Base):
     post: Mapped[int] = mapped_column(Integer, nullable=False)
     command_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
 
-    # subject of surveys (FK: Survey.subject_user_id)
+    # NEW personal fields (nullable, can be backfilled later)
+    first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    last_name:  Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    email:      Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    telegram:   Mapped[Optional[str]] = mapped_column(String(64),  nullable=True)
+
     surveys_subject: Mapped[list["Survey"]] = relationship(
         back_populates="subject_user",
         foreign_keys=lambda: [Survey.subject_user_id],
         cascade="all,delete",
         passive_deletes=True,
     )
-
-    # MISSING IN YOUR TRACE → add this:
     survey_responses: Mapped[list["SurveyRespondent"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
-
-    # optional but recommended if you relate answers to users
     answers: Mapped[list["SurveyAnswer"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
@@ -103,36 +106,36 @@ class Survey(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     subject_user_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("user_info.id", ondelete="RESTRICT"), nullable=False, index=True
+        BigInteger, ForeignKey("user_info.id", ondelete="RESTRICT"),
+        nullable=False, index=True
     )
+    respondent_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("user_info.id", ondelete="RESTRICT"),
+        nullable=False, index=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     deadline:   Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     notifications_before: Mapped[int] = mapped_column(BigInteger, nullable=False)
     anonymous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     review_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # already added earlier
 
     subject_user: Mapped["UserInfo"] = relationship(
-        back_populates="surveys_subject",
-        foreign_keys=[subject_user_id],
+        back_populates="surveys_subject", foreign_keys=[subject_user_id]
+    )
+    respondent_user: Mapped["UserInfo"] = relationship(
+        foreign_keys=[respondent_user_id], lazy="joined"
     )
 
     respondents: Mapped[list["SurveyRespondent"]] = relationship(
-        back_populates="survey",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
+        back_populates="survey", cascade="all, delete-orphan", passive_deletes=True
     )
-
     answers: Mapped[list["SurveyAnswer"]] = relationship(
-        back_populates="survey",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
+        back_populates="survey", cascade="all, delete-orphan", passive_deletes=True
     )
-
-    # NEW: reverse side for SurveyQuestion.survey(back_populates="questions")
     questions: Mapped[list["SurveyQuestion"]] = relationship(
-        back_populates="survey",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
+        back_populates="survey", cascade="all, delete-orphan", passive_deletes=True
     )
 
 
@@ -145,12 +148,13 @@ class SurveyQuestion(Base):
     survey_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
     )
-    __table_args__ = (
-        UniqueConstraint("question_id", "survey_id", name="survey_question_survey_id_question_id_idx"),
-    )
+    __table_args__ = (UniqueConstraint("question_id", "survey_id", name="survey_question_survey_id_question_id_idx"),)
 
-    survey: Mapped[Survey] = relationship(back_populates="questions")
-    question: Mapped[Question] = relationship(back_populates="in_surveys")
+    # NEW: optional flag
+    optional: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    survey: Mapped["Survey"] = relationship(back_populates="questions")
+    question: Mapped["Question"] = relationship(back_populates="in_surveys")
 
 class SurveyRespondent(Base):
     __tablename__ = "survey_respondent"
@@ -211,6 +215,10 @@ class EmployeeIn(BaseModel):
     telegram_id: int
     post: int
     command_id: int
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    telegram: Optional[str] = None
 
 class Employee(EmployeeIn):
     id: int
@@ -240,24 +248,31 @@ ReviewType = Literal["180", "360"]
 
 class InitiateSurveyIn(BaseModel):
     subject_user_id: int
-    reviewer_user_ids: List[int] = Field(
-        default_factory=list,
-        description="включая коллег и руководителя; для 360 самооценка добавится автоматически",
-    )
+    reviewer_user_ids: List[int] = Field(default_factory=list)
     review_type: ReviewType
     question_ids: Optional[List[int]] = None
     deadline: datetime
     notifications_before: int = 0
     anonymous: bool = False
+    title: Optional[str] = None  # optional survey title (shown in envelope)
 
     @field_validator("deadline")
     @classmethod
     def ensure_deadline_tz(cls, v: datetime) -> datetime:
-        # Convert naive datetimes to UTC to match timestamptz columns
+        # ensure aware (UTC) to match timestamptz
         if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
             return v.replace(tzinfo=timezone.utc)
         return v
+    
+class InitiatedPersonalSurvey(BaseModel):
+    surveyId: str
+    respondent_user_id: int
+    linkToken: str
 
+class InitiateSurveyBatchOut(BaseModel):
+    batch_created: List[InitiatedPersonalSurvey]
+    questions_count: int
+    
 class SurveyOut(BaseModel):
     id: int
     subject_user_id: int
@@ -328,7 +343,11 @@ class SurveyFormOut(BaseModel):
 # =========================
 
 app = FastAPI(title="360 Survey Backend", version="0.1.0")
-
+try:
+    from frontend_api import v1 as frontend_v1
+    app.include_router(frontend_v1)  # ensures router mounts on import
+except Exception as e:
+    print("Failed to load one_block_api:", e)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ALLOW_ORIGINS,
@@ -350,14 +369,15 @@ async def create_employee(payload: EmployeeIn, db: AsyncSession = Depends(get_se
     return Employee(id=obj.id, **payload.model_dump())
 
 @app.get("/employees", response_model=List[Employee])
-async def list_employees(
-    db: AsyncSession = Depends(get_session),
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
+async def list_employees(db: AsyncSession = Depends(get_session), limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
     res = await db.execute(select(UserInfo).limit(limit).offset(offset))
     rows = res.scalars().all()
-    return [Employee(id=r.id, telegram_id=r.telegram_id, post=r.post, command_id=r.command_id) for r in rows]
+    return [
+        Employee(
+            id=r.id, telegram_id=r.telegram_id, post=r.post, command_id=r.command_id,
+            first_name=r.first_name, last_name=r.last_name, email=r.email, telegram=r.telegram
+        ) for r in rows
+    ]
 
 @app.put("/employees/{employee_id}", response_model=Employee)
 async def update_employee(employee_id: int, payload: EmployeeIn, db: AsyncSession = Depends(get_session)):
@@ -369,7 +389,7 @@ async def update_employee(employee_id: int, payload: EmployeeIn, db: AsyncSessio
         setattr(obj, k, v)
     await db.commit()
     await db.refresh(obj)
-    return Employee(id=obj.id, telegram_id=obj.telegram_id, post=obj.post, command_id=obj.command_id)
+    return Employee(id=obj.id, **payload.model_dump())
 
 @app.delete("/employees/{employee_id}", status_code=204)
 async def delete_employee(employee_id: int, db: AsyncSession = Depends(get_session)):
@@ -525,83 +545,7 @@ async def build_question_ids(
     return ordered
 
 
-@app.post("/surveys/initiate", response_model=SurveyOut, status_code=201)
-async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(get_session)):
-    # validate subject
-    subj_exists = await db.scalar(
-        select(func.count())
-        .select_from(UserInfo)
-        .where(UserInfo.id == payload.subject_user_id)
-    )
-    if not subj_exists:
-        raise HTTPException(400, "subject_user_id not found")
 
-    # validate reviewers
-    if payload.reviewer_user_ids:
-        count = await db.scalar(
-            select(func.count())
-            .select_from(UserInfo)
-            .where(UserInfo.id.in_(payload.reviewer_user_ids))
-        )
-        if count != len(payload.reviewer_user_ids):
-            raise HTTPException(400, "Some reviewer_user_ids do not exist")
-
-    # validate & normalize questions
-    if not payload.question_ids:
-        raise HTTPException(400, "No questions selected")
-
-    seen: set[int] = set()
-    question_ids: List[int] = []
-    for qid in payload.question_ids:
-        if qid not in seen:
-            seen.add(qid)
-            question_ids.append(qid)
-
-    # ensure all questions exist
-    q_count = await db.scalar(
-        select(func.count())
-        .select_from(Question)
-        .where(Question.id.in_(question_ids))
-    )
-    if q_count != len(question_ids):
-        raise HTTPException(400, "Some question_ids do not exist")
-
-    # create survey (мета напрямую в Survey)
-    now = datetime.now(timezone.utc)
-    survey = Survey(
-        subject_user_id=payload.subject_user_id,
-        created_at=now,
-        deadline=payload.deadline,
-        notifications_before=payload.notifications_before,
-        anonymous=payload.anonymous,
-        review_type=payload.review_type
-    )
-    db.add(survey)
-    await db.flush()  # get survey.id
-
-    # link questions
-    db.add_all([SurveyQuestion(survey_id=survey.id, question_id=qid) for qid in question_ids])
-
-    # respondents: reviewers + (self if 360)
-    respondents = set(payload.reviewer_user_ids or [])
-    if payload.review_type == "360":
-        respondents.add(payload.subject_user_id)
-    db.add_all([SurveyRespondent(survey_id=survey.id, user_id=uid) for uid in respondents])
-
-    await db.commit()
-    await db.refresh(survey)
-
-    return SurveyOut(
-        id=survey.id,
-        subject_user_id=survey.subject_user_id,
-        created_at=survey.created_at,
-        deadline=survey.deadline,
-        notifications_before=survey.notifications_before,
-        anonymous=survey.anonymous,
-        review_type=payload.review_type,
-        participants_count=len(respondents),
-        questions_count=len(question_ids),
-    )
 
 
 @app.post("/surveys/{survey_id}/answers/bulk", status_code=201)
