@@ -167,7 +167,7 @@ export default function SurveyFlow({
     const prof = runtime.blocks.find((b) => b.type === "profile");
     const base = prof ? { [prof.id]: { ...runtime.respondent } } : {};
     setAnswers(base);
-    setVisited(Array(runtime.blocks.length).fill(false));
+    setVisited(Array.from({ length: runtime.blocks.length }, (_, i) => i === 0));
     setSubmitted(false);
     setCurrent(0);
   }
@@ -277,10 +277,16 @@ export default function SurveyFlow({
             blocks: [profileBlock, ...(srv.blocks || [])],
           });
           // Re-prefill profile with respondent from server
-          const base = { profile: { ...srv.respondent } };
-          setAnswers(base);
-          setVisited(Array((srv.blocks?.length ?? 0) + 1).fill(false));
-          setCurrent(0);
+          const saved = (() => {
+            try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; }
+          })();
+          const mergedAnswers = { ...saved, profile: { ...srv.respondent } };
+          setAnswers(mergedAnswers);
+          
+          const total = (srv.blocks?.length ?? 0) + 1; // +1 for profile
+          const startAt = computeStartIndex([profileBlock, ...(srv.blocks || [])], mergedAnswers);
+          setVisited(Array.from({ length: total }, (_, i) => i <= startAt));
+          setCurrent(startAt);
           setSubmitted(false);
         }
       } catch (e) {
@@ -343,6 +349,14 @@ export default function SurveyFlow({
     }
     return out;
   }
+  function computeStartIndex(blocks, answers) {
+  // first block that is NOT valid → we start there; if all valid → last block
+  for (let i = 0; i < blocks.length; i++) {
+    if (!isBlockValidForAnswers(blocks[i], answers)) return i;
+  }
+  return Math.max(0, blocks.length - 1);
+}
+
 
   async function submitToAPI() {
     if (!server.surveyId || !linkToken) return;
@@ -647,7 +661,7 @@ export default function SurveyFlow({
         </main>
 
         <footer className="mt-6 text-center text-xs text-white/40">
-          Built with ♥ for one‑block‑per‑page surveys.
+          Сделано командоЙ xUI -- Студия Артемия Лебедева.
         </footer>
       </div>
     </div>
