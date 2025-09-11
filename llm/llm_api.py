@@ -1,4 +1,4 @@
-from init_model import model
+from init_model import model, get_model
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers.string import StrOutputParser
 
@@ -32,7 +32,7 @@ def convert_reviews_to_text(data: ReviewsData) -> str:
     return "\n\n".join(reviews_texts)
 
 
-def get_summary(reviews: ReviewsData, system_prompt: str | None, user_prompt: str | None) -> str:
+def get_summary(reviews: ReviewsData, system_prompt: str | None, user_prompt: str | None, model_name: str = None) -> str:
     """
     Generates a summary of reviews using LLM.
 
@@ -40,6 +40,7 @@ def get_summary(reviews: ReviewsData, system_prompt: str | None, user_prompt: st
         reviews (ReviewsData): Review data containing all reviews and sections.
         system_prompt (str | None): System prompt for the model. If None, default will be used.
         user_prompt (str | None): User prompt for the model. If None, default will be used.
+        model_name (str): Name of the model to use. If None, default model will be used.
 
     Returns:
         str: Generated summary of the reviews.
@@ -53,13 +54,16 @@ def get_summary(reviews: ReviewsData, system_prompt: str | None, user_prompt: st
         with open("prompts/basic_user.txt", "r") as file:
             user_prompt = file.read()
 
+    # Use specified model or default
+    selected_model = get_model(model_name) if model_name else model
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("user", user_prompt)
     ])
 
     mes_parser = StrOutputParser()
-    runnable = prompt | model | mes_parser
+    runnable = prompt | selected_model | mes_parser
 
     summary = runnable.invoke({"reviews": reviews_text})
 
