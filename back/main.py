@@ -686,7 +686,29 @@ async def get_survey_form(
         questions=questions
     )
 
+@app.delete("/questions/{question_id}", status_code=204)
+async def delete_question(question_id: int, db: AsyncSession = Depends(get_session)):
+    # найдём вопрос
+    res = await db.execute(select(Question).where(Question.id == question_id))
+    obj = res.scalar_one_or_none()
+    if not obj:
+        raise HTTPException(404, "Question not found")
+    # удаляем; каскады очистят survey_question и survey_answer
+    await db.delete(obj)
+    await db.commit()
+    return
 
+@app.delete("/blocks/{block_id}", status_code=204)
+async def delete_block(block_id: int, db: AsyncSession = Depends(get_session)):
+    # найдём блок
+    res = await db.execute(select(Block).where(Block.id == block_id))
+    obj = res.scalar_one_or_none()
+    if not obj:
+        raise HTTPException(404, "Block not found")
+    # удаляем; каскадом удалятся его вопросы и все их связи/ответы
+    await db.delete(obj)
+    await db.commit()
+    return
 
 # =========================
 # Health
