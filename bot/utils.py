@@ -12,3 +12,4 @@ API_BASE = os.getenv("API_BASE")
 FRONTEND_BASE = os.getenv("FRONTEND_BASE")
 BTN_HR = "HR: Опросы"
 BTN_LIST_USERS = "Список пользователей"
+BTN_SUMMARY_Q = "Суммаризация по вопросу"

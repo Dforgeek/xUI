@@ -2,6 +2,7 @@ import asyncio
 import logging
 from typing import Optional, Tuple, List, Dict, Any
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -16,6 +17,7 @@ from reportlab.pdfbase.pdfmetrics import registerFontFamily
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import tempfile
 import os
+import re
 from pathlib import Path
 import pandas as pd
 import urllib
@@ -29,6 +31,7 @@ from utils import (
     USERS_FILE,
     BTN_HR,
     BTN_LIST_USERS,
+    BTN_SUMMARY_Q,
     FRONTEND_BASE
 )
 
@@ -36,6 +39,8 @@ from utils import (
 # =======================
 # Настройки / константы
 # =======================
+REFACTOR_REGEX = re.compile(r"(?<!\\)([_*\[\]()~`>#+\-=|{}.!])")
+
 
 
 def load_users() -> Dict[str, str]:
@@ -152,6 +157,11 @@ except Exception as e:
 # Бизнес-логика
 # =======================
 
+
+def markdown_formatter(text: str) -> str:
+    return re.sub(REFACTOR_REGEX, lambda m: "\\" + m.group(1), text)
+
+
 async def _build_token_url(token: str) -> str:
     """Собирает открываемую ссылку для FE. Ваш FE читает ?token=..."""
     base = FRONTEND_BASE.rstrip("/")
@@ -212,8 +222,11 @@ async def notify_respondents_about_survey(bot: Bot, creation_result: dict) -> Tu
             "Вам назначен новый опрос 360°.\n"
             f"Перейдите по ссылке и заполните: {url}"
         )
+
         try:
-            await bot.send_message(chat_id=tg_id, text=msg)
+            await bot.send_message(chat_id=tg_id, text=msg,
+                                  parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception as e:
@@ -320,6 +333,19 @@ class SurveyCreateForm(StatesGroup):
     waiting_new_question_type = State()
     waiting_new_question_answers = State()
     waiting_add_more_questions = State()
+
+class SummaryComputeForm(StatesGroup):
+    waiting_batch_id = State()
+    waiting_model_name = State()
+    waiting_prompt_version = State()
+
+
+class LocalSummForm(StatesGroup):
+    waiting_batch_id = State()
+    waiting_system_prompt = State()
+    waiting_user_prompt = State()
+
+
 # =======================
 # Keyboards
 # =======================
@@ -328,6 +354,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_CREATE_POLL)],
             [KeyboardButton(text=BTN_SUMMARY)],
+            [KeyboardButton(text=BTN_SUMMARY_Q)],
             [KeyboardButton(text=BTN_REGISTER)],
             [KeyboardButton(text=BTN_HR)],
             [KeyboardButton(text=BTN_LIST_USERS)],
@@ -365,17 +392,34 @@ API_BASE = "http://localhost:8000"
 
 
 async def http_get(path: str):
-    url = API_BASE.rstrip("/") + path
+    if path.startswith("http://") or path.startswith("https://"):
+        url = path
+    else:
+        url = API_BASE.rstrip("/") + path
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"GET {url} -> {resp.status}: {text}")
+            try:
+                return await resp.json()
+            except Exception:
+                return text
 
 
 async def http_post(path: str, json_body: dict):
-    url = API_BASE.rstrip("/") + path
+    if path.startswith("http://") or path.startswith("https://"):
+        url = path
+    else:
+        url = API_BASE.rstrip("/") + path
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=json_body) as resp:
+        async with session.post(url, json=json_body, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:
                 raise RuntimeError(f"POST {url} -> {resp.status}: {text}")
@@ -388,6 +432,66 @@ async def http_post(path: str, json_body: dict):
 # =======================
 # Утилиты для отображения списков вопросов (строка)
 # =======================
+
+async def _fetch_reviews_for_batch(batch_id: int) -> dict:
+    """
+    Пытаемся получить сырой корпус отзывов для локального summarize-сервиса (8002).
+    Возвращает объект формата:
+    {
+      "reviews": {
+        "reviews": [
+          {"sections": [{"title": "...", "text": "..."}, ...]}
+        ]
+      }
+    }
+    При отсутствии прямого эндпоинта — фоллбэк по stats.per_question из /v1/summaries/compute.
+    """
+    # 1) Пробуем специализированный эндпоинт, если он есть в вашем бэке:
+    try:
+        maybe = await http_get(f"/v1/summaries/reviews?batch_id={batch_id}")
+        # ожидаем, что maybe уже в нужном формате или содержит ключ 'reviews'
+        if isinstance(maybe, dict):
+            if "reviews" in maybe and isinstance(maybe["reviews"], dict):
+                return maybe  # уже готово
+            # иногда бек может вернуть просто {"reviews": [...]} — завернём
+            if "reviews" in maybe and isinstance(maybe["reviews"], list):
+                return {"reviews": {"reviews": maybe["reviews"]}}
+    except Exception:
+        pass
+
+    # 2) Фоллбэк: дергаем compute и составляем секции из per_question.sample
+    try:
+        comp = await http_post("/v1/summaries/compute", {
+            "batch_id": batch_id,
+            "model_name": "deepseek-chat",
+            "prompt_version": 2
+        })
+        per_q = {}
+        stats = comp.get("stats")
+        if isinstance(stats, dict):
+            per_q = stats.get("per_question") or {}
+        sections = []
+        # аккуратно по возрастанию ключей, если они строковые
+        try:
+            order = sorted((int(k) for k in per_q.keys()))
+            iter_items = [(k, per_q.get(str(k)) or {}) for k in order]
+        except Exception:
+            iter_items = per_q.items()
+
+        for qid, info in iter_items:
+            title = info.get("question") or f"Q{qid}"
+            text = info.get("sample") or ""
+            if text:
+                sections.append({"title": title, "text": text})
+
+        if not sections:
+            sections = [{"title": "empty", "text": ""}]
+
+        return {"reviews": {"reviews": [{"sections": sections}]}}
+    except Exception as e:
+        raise RuntimeError(f"Не удалось получить данные для batch_id={batch_id}: {e}")
+
+
 def render_questions_list(questions: List[dict], limit: int = 200) -> str:
     # Возвращает нумерованный список вопроса в формате "1. текст (id: 12)"
     lines = []
@@ -399,6 +503,135 @@ def render_questions_list(questions: List[dict], limit: int = 200) -> str:
         if len(lines) >= limit:
             break
     return "\n".join(lines) if lines else "(вопросов нет)"
+
+
+async def start_local_summarize_by_batch(message: types.Message, state: FSMContext):
+    await state.set_state(LocalSummForm.waiting_batch_id)
+    await message.answer(
+        "Локальная суммаризация по batch_id (порт 8002).\n"
+        "Шаг 1/3 — введите batch_id (целое число):",
+        reply_markup=cancel_kb(),
+    )
+
+async def lsb_batch_id(message: types.Message, state: FSMContext):
+    bid = _parse_int(message.text)
+    if bid is None or bid < 1:
+        await message.answer("batch_id должен быть целым числом ≥ 1. Повторите ввод.")
+        return
+    await state.update_data(batch_id=bid)
+    await state.set_state(LocalSummForm.waiting_system_prompt)
+    await message.answer(
+        "Шаг 2/3 — system_prompt (или отправьте 'по умолчанию' — будет пусто).",
+        reply_markup=cancel_kb(),
+    )
+
+async def lsb_system_prompt(message: types.Message, state: FSMContext):
+    sp = message.text.strip()
+    if sp.lower() in ("по умолчанию", "default"):
+        sp = ""
+    await state.update_data(system_prompt=sp)
+    await state.set_state(LocalSummForm.waiting_user_prompt)
+    await message.answer(
+        "Шаг 3/3 — user_prompt (или 'по умолчанию' — краткая русская выжимка).",
+        reply_markup=cancel_kb(),
+    )
+
+# async def lsb_user_prompt(message: types.Message, state: FSMContext):
+#     up = message.text.strip()
+#     if up.lower() in ("по умолчанию", "default", ""):
+#         up = "Суммаризируй кратко и по-русски."
+#     data = await state.get_data()
+#     batch_id = data["batch_id"]
+#     system_prompt = data["system_prompt"]
+#
+#     # 1) Тянем текст по batch_id
+#     try:
+#         reviews_payload = await _fetch_reviews_for_batch(batch_id)
+#     except Exception as e:
+#         await state.clear()
+#         await message.answer(f"Не удалось подтянуть текст по batch_id={batch_id}: {e}",
+#                              reply_markup=main_menu_kb())
+#         return
+#
+#     # 2) Собираем финальный payload для локального сервиса
+#     payload = {
+#         "reviews": reviews_payload.get("reviews") or {"reviews": []},
+#         "system_prompt": system_prompt,
+#         "user_prompt": up,
+#     }
+#     print(payload)
+#
+#     logging.info("[LOCAL-SUMM-BATCH] POST 8002/summarize for batch_id=%s", batch_id)
+#
+#     try:
+#         result = await http_post("http://localhost:8002/summarize", payload)
+#         print(result)
+#     except Exception as e:
+#         await state.clear()
+#         await message.answer(f"Ошибка локальной суммаризации: {e}", reply_markup=main_menu_kb())
+#         return
+#
+#     await state.clear()
+#
+#     summary = (result.get("summary") if isinstance(result, dict) else None) or str(result)
+#     header = f"Суммаризация (batch_id={batch_id}):"
+#     for chunk in _chunk_send_text(header + "\n\n" + summary):
+#         await message.answer(chunk, reply_markup=main_menu_kb())
+
+async def lsb_user_prompt(message: types.Message, state: FSMContext):
+    up = message.text.strip()
+    if up.lower() in ("по умолчанию", "default", ""):
+        up = "Суммаризируй кратко и по-русски."
+
+    data = await state.get_data()
+    batch_id = data["batch_id"]
+    system_prompt = data["system_prompt"]
+
+    # 1) Тянем сырьё по batch_id (как у вас уже сделано)
+    try:
+        reviews_payload = await _fetch_reviews_for_batch(batch_id)
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"Не удалось подтянуть текст по batch_id={batch_id}: {e}",
+                             reply_markup=main_menu_kb())
+        return
+
+    # 2) Собираем плоский текст для inline-подстраховки
+    sections = ((reviews_payload or {}).get("reviews") or {}).get("reviews") or []
+    flat_lines = []
+    for obj in sections:
+        for sec in (obj.get("sections") or []):
+            title = (sec.get("title") or "").strip()
+            text = (sec.get("text") or "").strip()
+            if title or text:
+                flat_lines.append(f"{title}: {text}".strip(": "))
+
+    inline_reviews = "\n".join(flat_lines) if flat_lines else ""
+
+    # 3) Финальный payload — строго по спецификации + inline дублирование в user_prompt
+    payload = {
+        "reviews": reviews_payload.get("reviews") or {"reviews": []},
+        "system_prompt": system_prompt,
+        "user_prompt": f"{up}\n\n=== REVIEWS ===\n{inline_reviews}" if inline_reviews else up,
+    }
+
+    logging.info("[LOCAL-SUMM-BATCH] POST 8002/summarize for batch_id=%s", batch_id)
+
+    try:
+        result = await http_post("http://localhost:8002/summarize", payload)
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"Ошибка локальной суммаризации: {e}", reply_markup=main_menu_kb())
+        return
+
+    await state.clear()
+
+    summary = (result.get("summary") if isinstance(result, dict) else None) or str(result)
+    header = f"Суммаризация (batch_id={batch_id}):"
+    for chunk in _chunk_send_text(header + "\n\n" + summary):
+        await message.answer(chunk, reply_markup=main_menu_kb())
+
+
 
 
 def build_survey_link(token: str, frontend_base: Optional[str] = None) -> str:
@@ -413,6 +646,97 @@ def build_survey_link(token: str, frontend_base: Optional[str] = None) -> str:
     q["token"] = token
     parts[3] = urlencode(q)
     return urlunsplit(parts)
+
+
+async def start_local_summarize(message: types.Message, state: FSMContext):
+    await state.set_state(LocalSummForm.waiting_reviews_or_text)
+    await message.answer(
+        "Локальная суммаризация (порт 8002).\n"
+        "Шаг 1/3 — пришлите *либо* готовый JSON (как в примере), *либо* обычный текст.\n"
+        "Если пришлёте текст, я сам оберну его в формат `reviews`.",
+        reply_markup=cancel_kb(),
+    )
+
+async def ls_reviews_or_text(message: types.Message, state: FSMContext):
+    raw = message.text.strip()
+    await state.update_data(_raw_payload=raw)
+    await state.set_state(LocalSummForm.waiting_system_prompt)
+    await message.answer(
+        "Шаг 2/3 — system_prompt (или отправьте 'по умолчанию' чтобы оставить пустым).",
+        reply_markup=cancel_kb(),
+    )
+
+async def ls_system_prompt(message: types.Message, state: FSMContext):
+    sp = message.text.strip()
+    if sp.lower() in ("по умолчанию", "default"):
+        sp = ""
+    await state.update_data(system_prompt=sp)
+    await state.set_state(LocalSummForm.waiting_user_prompt)
+    await message.answer(
+        "Шаг 3/3 — user_prompt (или 'по умолчанию' для краткой русской выжимки).",
+        reply_markup=cancel_kb(),
+    )
+
+async def ls_user_prompt(message: types.Message, state: FSMContext):
+    up = message.text.strip()
+    if up.lower() in ("по умолчанию", "default", ""):
+        up = "Суммаризируй кратко и по-русски."
+    data = await state.get_data()
+    raw = data.get("_raw_payload", "")
+
+    # Попробуем понять: это JSON из примера или обычный текст?
+    payload: dict
+    try:
+        import json
+        maybe = json.loads(raw)
+        # Если это уже валидный объект и там есть ключи нужного формата — отправляем как есть, добивая промпты
+        if isinstance(maybe, dict) and ("reviews" in maybe or "system_prompt" in maybe or "user_prompt" in maybe):
+            maybe.setdefault("reviews", {"reviews": [{"sections": [{"title": "text", "text": ""}]}]})
+            maybe["system_prompt"] = data.get("system_prompt", "")
+            maybe["user_prompt"] = up
+            payload = maybe
+        else:
+            raise ValueError("not expected shape")
+    except Exception:
+        # Это обычный текст — оборачиваем по контракту сервиса
+        payload = {
+            "reviews": {
+                "reviews": [
+                    {"sections": [{"title": "text", "text": raw}]}
+                ]
+            },
+            "system_prompt": data.get("system_prompt", ""),
+            "user_prompt": up,
+        }
+
+    logging.info("[LOCAL-SUMM] POST 8002/summarize payload_keys=%s",
+                 list(payload.keys()))
+    try:
+        result = await http_post("http://localhost:8002/summarize", payload)
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"Ошибка локальной суммаризации: {e}", reply_markup=main_menu_kb())
+        return
+
+    await state.clear()
+
+    summary = (result.get("summary") if isinstance(result, dict) else None) or str(result)
+    for chunk in _chunk_send_text(summary):
+        await message.answer(chunk, reply_markup=main_menu_kb())
+
+
+def _chunk_send_text(text: str, max_len: int = 3500) -> List[str]:
+    lines = text.splitlines()
+    out, buf, size = [], [], 0
+    for ln in lines:
+        if size + len(ln) + 1 > max_len:
+            out.append("\n".join(buf))
+            buf, size = [], 0
+        buf.append(ln)
+        size += len(ln) + 1
+    if buf:
+        out.append("\n".join(buf))
+    return out
 
 
 def _parse_int(text: str) -> Optional[int]:
@@ -842,6 +1166,102 @@ async def show_registered_users(message: types.Message):
         size += len(line) + 1
     if chunk:
         await message.answer("\n".join(chunk))
+
+# ===== Summaries: compute =====
+async def start_compute_summary(message: types.Message, state: FSMContext):
+    await state.set_state(SummaryComputeForm.waiting_batch_id)
+    await message.answer(
+        "Суммаризация по вопросу.\n"
+        "Шаг 1/3 — введите batch_id (целое число):",
+        reply_markup=cancel_kb(),
+    )
+
+async def sc_batch_id(message: types.Message, state: FSMContext):
+    bid = _parse_int(message.text)
+    if bid is None or bid < 1:
+        await message.answer("batch_id должен быть целым числом ≥ 1. Повторите ввод.")
+        return
+    await state.update_data(batch_id=bid)
+    await state.set_state(SummaryComputeForm.waiting_model_name)
+    await message.answer(
+        "Шаг 2/3 — введите model_name или отправьте 'по умолчанию'.\n"
+        "По умолчанию: deepseek-chat",
+        reply_markup=cancel_kb(),
+    )
+
+async def sc_model_name(message: types.Message, state: FSMContext):
+    raw = message.text.strip()
+    model = "deepseek-chat" if raw.lower() in ("", "по умолчанию", "default") else raw
+    await state.update_data(model_name=model)
+    await state.set_state(SummaryComputeForm.waiting_prompt_version)
+    await message.answer(
+        "Шаг 3/3 — введите prompt_version (целое) или отправьте 'по умолчанию'.\n"
+        "По умолчанию: 2",
+        reply_markup=cancel_kb(),
+    )
+
+async def sc_prompt_version(message: types.Message, state: FSMContext):
+    raw = message.text.strip().lower()
+    if raw in ("", "по умолчанию", "default"):
+        pv = 2
+    else:
+        pv = _parse_int(raw)
+        if pv is None or pv < 1:
+            await message.answer("prompt_version должен быть целым числом ≥ 1 или 'по умолчанию'. Повторите ввод.")
+            return
+
+    data = await state.get_data()
+    payload = {
+        "batch_id": data["batch_id"],
+        "model_name": data["model_name"],
+        "prompt_version": pv,
+    }
+
+    try:
+        result = await http_post("/v1/summaries/compute", payload)
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"Ошибка при суммаризации: {e}", reply_markup=main_menu_kb())
+        return
+
+    await state.clear()
+
+    # Форматируем вывод
+    summary_text = result.get("summary_text") or "(summary_text пуст)"
+    stats = result.get("stats", {}) or {}
+    per_q = (stats.get("per_question") or {}) if isinstance(stats, dict) else {}
+
+    header = (
+        "Суммаризация готова.\n"
+        f"batch_id: {result.get('batch_id')}, subject_user_id: {result.get('subject_user_id')}\n"
+        f"status: {result.get('status')}, model: {result.get('model_name')}, prompt_v: {result.get('prompt_version')}\n"
+        f"created: {result.get('created_at')}, updated: {result.get('updated_at')}\n"
+    )
+
+    # Краткий блок per_question
+    pq_lines = []
+    try:
+        # перебирать в порядке id
+        for qid in sorted((int(k) for k in per_q.keys())):
+            info = per_q.get(str(qid)) or {}
+            title = info.get("question") or f"Q{qid}"
+            n = info.get("n")
+            sample = info.get("sample")
+            pq_lines.append(f"- {title} — n={n}, sample: {sample}")
+    except Exception:
+        pass
+
+    body = [header, "— — —", summary_text]
+    if pq_lines:
+        body.append("\nКратко по вопросам:")
+        body.extend(pq_lines)
+
+    full = "\n".join(body)
+
+    # Разбиваем и отправляем
+    for chunk in _chunk_send_text(full):
+        await message.answer(chunk, reply_markup=main_menu_kb())
+
 
 
 async def fetch_employee_telegram_id(employee_id: int, api_base: Optional[str] = None) -> Optional[int]:
@@ -1559,6 +1979,21 @@ async def main():
     dp.message.register(hr_create_question_answers, HRForm.creating_question_answers)
     dp.message.register(hr_viewing_preset_details, HRForm.viewing_preset_details)
     dp.message.register(hr_confirm_send, HRForm.confirming_send_preset)
+
+    # dp.message.register(start_compute_summary, F.text == BTN_SUMMARY_Q)
+    # dp.message.register(sc_batch_id, SummaryComputeForm.waiting_batch_id)
+    # dp.message.register(sc_model_name, SummaryComputeForm.waiting_model_name)
+    # dp.message.register(sc_prompt_version, SummaryComputeForm.waiting_prompt_version)
+
+    dp.message.register(start_local_summarize_by_batch, F.text == BTN_SUMMARY_Q)
+
+    # dp.message.register(ls_reviews_or_text, LocalSummForm.waiting_reviews_or_text)
+    # dp.message.register(ls_system_prompt, LocalSummForm.waiting_system_prompt)
+    # dp.message.register(ls_user_prompt, LocalSummForm.waiting_user_prompt)
+    dp.message.register(lsb_batch_id, LocalSummForm.waiting_batch_id)
+    dp.message.register(lsb_system_prompt, LocalSummForm.waiting_system_prompt)
+    dp.message.register(lsb_user_prompt, LocalSummForm.waiting_user_prompt)
+
 
     await dp.start_polling(bot)
 
