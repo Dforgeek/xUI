@@ -1,11 +1,8 @@
-import enum
 from datetime import datetime, timezone
-from typing import List, Optional, Literal, Dict, Any, Set
+from typing import List, Optional, Literal, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
-from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
@@ -13,12 +10,12 @@ import os
 
 from sqlalchemy import (
     BigInteger, SmallInteger, String, Text, ARRAY, Integer, ForeignKey,
-    Index, UniqueConstraint, select, func, and_, literal_column, Boolean, DateTime
+    Index, UniqueConstraint, select, func, and_, Boolean, DateTime
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
-from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import JSONB
+from openpyxl import load_workbook
 
 # =========================
 # Settings
@@ -464,7 +461,6 @@ async def delete_employee(employee_id: int, db: AsyncSession = Depends(get_sessi
     return
 
 # = Excel import =
-from openpyxl import load_workbook
 @app.post("/employees/import-xlsx", response_model=Dict[str, int])
 async def import_employees_xlsx(file: UploadFile = File(...), db: AsyncSession = Depends(get_session)):
     if not file.filename.lower().endswith((".xlsx", ".xlsm")):

@@ -1277,7 +1277,7 @@ async def hr_handle_creating_preset_questions(
 
     data = await state.get_data()
     qmap = data.get("question_index_map", {})
-    all_questions = data.get("all_questions", [])
+    data.get("all_questions", [])
     try:
         sel_numbers = parse_selection(text)
     except Exception as e:
@@ -1398,7 +1398,7 @@ async def hr_create_question_answers(message: types.Message, state: FSMContext):
         return
 
     # После создания вопроса возвращаемся к созданию пресета, если в state был flow создания пресета
-    data_prev = await state.get_data()
+    await state.get_data()
     # Если до создания вопроса мы были в процессе выбора вопросов — загрузим все вопросы снова и попросим выбрать
     await state.clear()
     await message.answer(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -13,9 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from main import (
     get_session,
     Survey, SurveyBatch, SurveyQuestion, Question,
-    ReviewSummary, UserInfo
+    ReviewSummary
 )
-from sqlalchemy.dialects.postgresql import JSONB
 
 v1 = APIRouter(prefix="/v1", tags=["Summaries"])
 
@@ -188,13 +186,16 @@ async def get_summary(summaryId: int, db: AsyncSession = Depends(get_session)):
 
 @v1.post("/summaries", response_model=SummaryOut, status_code=201)
 async def create_summary(payload: SummaryCreateIn, db: AsyncSession = Depends(get_session)):
-    prog = await _batch_progress(db, payload.batch_id)
+    await _batch_progress(db, payload.batch_id)
     rs = await _ensure_summary_row(db, payload.batch_id)
     # Keep queued unless caller wants to immediately mark running; caller can PATCH
-    if payload.model_name is not None: rs.model_name = payload.model_name
-    if payload.prompt_version is not None: rs.prompt_version = payload.prompt_version
+    if payload.model_name is not None:
+        rs.model_name = payload.model_name
+    if payload.prompt_version is not None:
+        rs.prompt_version = payload.prompt_version
     rs.updated_at = _now()
-    await db.commit(); await db.refresh(rs)
+    await db.commit()
+    await db.refresh(rs)
     return await get_summary(rs.id, db)
 
 @v1.patch("/summaries/{summaryId}", response_model=SummaryOut)
@@ -205,7 +206,8 @@ async def update_summary(summaryId: int, payload: SummaryUpdateIn, db: AsyncSess
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(rs, k, v)
     rs.updated_at = _now()
-    await db.commit(); await db.refresh(rs)
+    await db.commit()
+    await db.refresh(rs)
     return await get_summary(rs.id, db)
 
 @v1.delete("/summaries/{summaryId}", status_code=204)
@@ -213,7 +215,8 @@ async def delete_summary(summaryId: int, db: AsyncSession = Depends(get_session)
     rs = await db.scalar(select(ReviewSummary).where(ReviewSummary.id == summaryId))
     if not rs:
         raise HTTPException(404, "Summary not found")
-    await db.delete(rs); await db.commit()
+    await db.delete(rs)
+    await db.commit()
     return
 
 @v1.get("/summaries/ready", response_model=List[SummaryOut])
@@ -249,18 +252,26 @@ async def compute_summary(payload: ComputeIn, db: AsyncSession = Depends(get_ses
 
     rs = await _ensure_summary_row(db, payload.batch_id)
     rs.status = "running"
-    if payload.model_name: rs.model_name = payload.model_name
-    if payload.prompt_version is not None: rs.prompt_version = payload.prompt_version
-    rs.started_at = _now(); rs.updated_at = rs.started_at
-    await db.commit(); await db.refresh(rs)
+    if payload.model_name: 
+        rs.model_name = payload.model_name
+    if payload.prompt_version is not None:
+        rs.prompt_version = payload.prompt_version
+    rs.started_at = _now()
+    rs.updated_at = rs.started_at
+    await db.commit()
+    await db.refresh(rs)
 
     # Aggregate answers across all surveys in the batch
     #  - avg rating per question_id
     #  - collect text answers
     surveys = (await db.execute(select(Survey.id).where(Survey.batch_id == payload.batch_id))).scalars().all()
     if not surveys:
-        rs.status = "failed"; rs.error = "No surveys in batch"; rs.completed_at = _now(); rs.updated_at = rs.completed_at
-        await db.commit(); await db.refresh(rs)
+        rs.status = "failed"
+        rs.error = "No surveys in batch"
+        rs.completed_at = _now()
+        rs.updated_at = rs.completed_at
+        await db.commit()
+        await db.refresh(rs)
         return await get_summary(rs.id, db)
 
     # Fetch responses JSONB
@@ -285,9 +296,11 @@ async def compute_summary(payload: ComputeIn, db: AsyncSession = Depends(get_ses
     texts: Dict[int, List[str]] = {}
 
     for (answers,) in rows:
-        if not answers: continue
+        if not answers:
+            continue
         for k, v in answers.items():
-            if not k.startswith("q"): continue
+            if not k.startswith("q"):
+                continue
             try:
                 qid = int(k[1:])
             except Exception:
@@ -341,7 +354,8 @@ async def compute_summary(payload: ComputeIn, db: AsyncSession = Depends(get_ses
     rs.completed_at = _now()
     rs.updated_at = rs.completed_at
 
-    await db.commit(); await db.refresh(rs)
+    await db.commit()
+    await db.refresh(rs)
     return await get_summary(rs.id, db)
 
 

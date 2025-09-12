@@ -19,20 +19,18 @@ from __future__ import annotations
 import json
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path, Security, status, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Security, Query
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import (
     BigInteger,
     String,
-    Text,
     Boolean,
     DateTime,
     ForeignKey,
     UniqueConstraint,
-    Index,
     select,
     func,
     and_,
@@ -40,7 +38,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload, joinedload
+from sqlalchemy.orm import Mapped, mapped_column, relationship, selectinload, joinedload
 
 # ---------------------------------------------------------------------------
 # Bring in your Session + Base + existing models via imports OR paste below
@@ -60,7 +58,6 @@ try:
         InitiateSurveyBatchOut, 
         InitiateSurveyIn, 
         InitiatedPersonalSurvey, 
-        SurveyRespondent,
         SurveyBatch,      
         ReviewSummary
     )
@@ -255,9 +252,6 @@ class SurveyListItemOut(BaseModel):
 
 
 # ----- Helpers -----
-# ISO helper
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 # Eager loader for token + related rows (prevents MissingGreenlet)
 async def _load_linked_context(db: AsyncSession, link_token: str) -> tuple[SurveyLinkToken, Survey, UserInfo, UserInfo]:
@@ -692,7 +686,8 @@ async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(
     reviewers: List[int] = []
     for uid in payload.reviewer_user_ids:
         if uid not in seen:
-            seen.add(uid); reviewers.append(uid)
+            seen.add(uid)
+            reviewers.append(uid)
     if payload.review_type == "360" and payload.subject_user_id not in seen:
         reviewers.append(payload.subject_user_id)
 
@@ -709,7 +704,8 @@ async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(
     q_seen, question_ids = set(), []
     for qid in payload.question_ids:
         if qid not in q_seen:
-            q_seen.add(qid); question_ids.append(qid)
+            q_seen.add(qid)
+            question_ids.append(qid)
     q_count = await db.scalar(select(func.count()).select_from(Question).where(Question.id.in_(question_ids)))
     if q_count != len(question_ids):
         raise HTTPException(400, "Some question_ids do not exist")
