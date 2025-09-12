@@ -60,7 +60,9 @@ try:
         InitiateSurveyBatchOut, 
         InitiateSurveyIn, 
         InitiatedPersonalSurvey, 
-        SurveyRespondent
+        SurveyRespondent,
+        SurveyBatch,      
+        ReviewSummary
     )
 except Exception as _e:
     raise RuntimeError(
@@ -480,7 +482,48 @@ async def create_response(
     db.add(rsp)
     await db.commit()
     await db.refresh(rsp)
+    try:
+        batch_id = link.survey.batch_id
+        if batch_id:
+            now2 = _now_utc()
+            expected = await db.scalar(
+                select(SurveyBatch.expected_respondents).where(SurveyBatch.id == batch_id)
+            )
+            responded = await db.scalar(
+                select(func.count())
+                .select_from(SurveyResponse)
+                .join(Survey, Survey.id == SurveyResponse.survey_id)
+                .where(Survey.batch_id == batch_id)
+            )
+            deadline = await db.scalar(
+                select(SurveyBatch.deadline).where(SurveyBatch.id == batch_id)
+            )
 
+            ready = (
+                (responded is not None and expected is not None and int(responded) >= int(expected))
+                or (deadline and now2 > deadline)
+            )
+
+            if ready:
+                exists = await db.scalar(
+                    select(func.count())
+                    .select_from(ReviewSummary)
+                    .where(ReviewSummary.batch_id == batch_id)
+                )
+                if not exists:
+                    db.add(
+                        ReviewSummary(
+                            batch_id=batch_id,
+                            subject_user_id=link.survey.subject_user_id,
+                            status="queued",
+                            created_at=now2,
+                            updated_at=now2,
+                        )
+                    )
+                    await db.commit()
+    except Exception:
+        # Don't block respondent flow if this fails.
+        pass
     return ResponseCreated(
         responseId=f"rsp_{rsp.id}",
         surveyId=f"srv_{sid}",
@@ -635,56 +678,65 @@ async def list_surveys(
 
 @v1.post("/surveys/initiate", response_model=InitiateSurveyBatchOut, status_code=201, tags=["Surveys"])
 async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(get_session)):
-    # 1) Validate subject
+    # Validate subject
     subject_exists = await db.scalar(
         select(func.count()).select_from(UserInfo).where(UserInfo.id == payload.subject_user_id)
     )
     if not subject_exists:
         raise HTTPException(400, "subject_user_id not found")
 
-    # 2) Normalize reviewers (unique)
+    # Reviewers (unique, auto-include subject for 360)
     if not payload.reviewer_user_ids:
         raise HTTPException(400, "reviewer_user_ids must contain at least one user")
     seen: Set[int] = set()
     reviewers: List[int] = []
     for uid in payload.reviewer_user_ids:
         if uid not in seen:
-            seen.add(uid)
-            reviewers.append(uid)
-
-    # Optionally auto-include subject for 360
+            seen.add(uid); reviewers.append(uid)
     if payload.review_type == "360" and payload.subject_user_id not in seen:
         reviewers.append(payload.subject_user_id)
 
-    # Validate reviewers exist
+    # Validate reviewers
     count_reviewers = await db.scalar(
         select(func.count()).select_from(UserInfo).where(UserInfo.id.in_(reviewers))
     )
     if count_reviewers != len(reviewers):
         raise HTTPException(400, "Some reviewer_user_ids do not exist")
 
-    # 3) Validate & normalize questions
+    # Validate questions
     if not payload.question_ids:
         raise HTTPException(400, "No questions selected")
     q_seen, question_ids = set(), []
     for qid in payload.question_ids:
         if qid not in q_seen:
-            q_seen.add(qid)
-            question_ids.append(qid)
-    q_count = await db.scalar(
-        select(func.count()).select_from(Question).where(Question.id.in_(question_ids))
-    )
+            q_seen.add(qid); question_ids.append(qid)
+    q_count = await db.scalar(select(func.count()).select_from(Question).where(Question.id.in_(question_ids)))
     if q_count != len(question_ids):
         raise HTTPException(400, "Some question_ids do not exist")
 
-    # 4) Create one personal Survey per respondent; mint unique token
     now = datetime.now(timezone.utc)
-    created: List[InitiatedPersonalSurvey] = []
 
+    # NEW: Create the batch
+    batch = SurveyBatch(
+        subject_user_id=payload.subject_user_id,
+        review_type=payload.review_type,
+        title=payload.title,
+        created_at=now,
+        deadline=payload.deadline,
+        notifications_before=payload.notifications_before,
+        anonymous=payload.anonymous,
+        expected_respondents=len(reviewers),
+    )
+    db.add(batch)
+    await db.flush()  # get batch.id
+
+    # Create per-respondent surveys within this batch
+    created: List[InitiatedPersonalSurvey] = []
     for respondent_id in reviewers:
         survey = Survey(
+            batch_id=batch.id,
             subject_user_id=payload.subject_user_id,
-            respondent_user_id=respondent_id,           # <-- personal binding; replaces survey_respondent
+            respondent_user_id=respondent_id,
             created_at=now,
             deadline=payload.deadline,
             notifications_before=payload.notifications_before,
@@ -693,27 +745,20 @@ async def initiate_survey(payload: InitiateSurveyIn, db: AsyncSession = Depends(
             title=payload.title,
         )
         db.add(survey)
-        await db.flush()  # get survey.id without a full commit
+        await db.flush()
 
-        # Same question set for each personal survey
         db.add_all([SurveyQuestion(survey_id=survey.id, question_id=qid) for qid in question_ids])
 
-        # NO legacy insert into survey_respondent here.
-
-        # Mint a unique link token for this (survey, respondent)
         token = await create_link_token(db, survey_id=survey.id, respondent_user_id=respondent_id)
-
         created.append(
             InitiatedPersonalSurvey(
-                surveyId=f"srv_{survey.id}",
-                respondent_user_id=respondent_id,
-                linkToken=token,
+                surveyId=f"srv_{survey.id}", respondent_user_id=respondent_id, linkToken=token
             )
         )
 
-    # Finalize the batch
     await db.commit()
     return InitiateSurveyBatchOut(batch_created=created, questions_count=len(question_ids))
+
 
 # # Mount under your existing FastAPI app
 # app.include_router(v1)

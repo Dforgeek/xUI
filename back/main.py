@@ -18,6 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
 from sqlalchemy import update
+from sqlalchemy.dialects.postgresql import JSONB
 
 # =========================
 # Settings
@@ -104,7 +105,9 @@ class SurveyPreset(Base):
 class Survey(Base):
     __tablename__ = "survey"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-
+    batch_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("survey_batch.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     subject_user_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("user_info.id", ondelete="RESTRICT"),
         nullable=False, index=True
@@ -137,6 +140,8 @@ class Survey(Base):
     questions: Mapped[list["SurveyQuestion"]] = relationship(
         back_populates="survey", cascade="all, delete-orphan", passive_deletes=True
     )
+    batch: Mapped[Optional["SurveyBatch"]] = relationship(back_populates="surveys")
+
 
 
 class SurveyQuestion(Base):
@@ -195,6 +200,54 @@ class SurveyAnswer(Base):
     survey: Mapped["Survey"] = relationship(back_populates="answers")
     user:   Mapped["UserInfo"] = relationship(back_populates="answers")
     question: Mapped["Question"] = relationship(back_populates="answers")
+
+
+
+# NEW: Batch & Summary models
+class SurveyBatch(Base):
+    __tablename__ = "survey_batch"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    subject_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("user_info.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    review_type: Mapped[str] = mapped_column(String(10), nullable=False, default="180")
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deadline:   Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    notifications_before: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    anonymous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    expected_respondents: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    surveys: Mapped[list["Survey"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+class ReviewSummary(Base):
+    __tablename__ = "review_summary"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    batch_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("survey_batch.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    subject_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("user_info.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False)  # queued|running|succeeded|failed
+    model_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    prompt_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    summary_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stats: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    batch: Mapped["SurveyBatch"] = relationship(lazy="joined")
 
 # =========================
 # Engine / Session
@@ -346,8 +399,17 @@ app = FastAPI(title="360 Survey Backend", version="0.1.0")
 try:
     from frontend_api import v1 as frontend_v1
     app.include_router(frontend_v1)  # ensures router mounts on import
+    
 except Exception as e:
     print("Failed to load one_block_api:", e)
+    
+try:
+    from summaries_api import v1 as summaries_v1
+    app.include_router(summaries_v1)
+except Exception as e:
+    print("Failed to load summaries_api:", e)
+
+    
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ALLOW_ORIGINS,

@@ -127,3 +127,55 @@ create index if not exists survey_response_user_idx   on survey_response(respond
 --   survey_respondent
 --   survey_answer
 -- They are superseded by per-respondent Survey rows and survey_response JSONB.
+
+
+-- =========================
+-- Batches (group per subject/run) + Summaries
+-- =========================
+
+create table if not exists survey_batch
+(
+    id bigserial primary key,
+    subject_user_id bigint not null references user_info(id) on delete restrict,
+    review_type varchar(10) not null default '180',
+    title varchar(255),
+    created_at timestamptz not null,
+    deadline   timestamptz not null,
+    notifications_before bigint not null default 0,
+    anonymous boolean not null default false,
+
+    expected_respondents int not null,
+    unique (subject_user_id, created_at) -- practical de-dup guard for same-second runs
+);
+create index if not exists survey_batch_subject_idx on survey_batch(subject_user_id);
+create index if not exists survey_batch_deadline_idx on survey_batch(deadline);
+
+-- ALTER survey to link to batch
+alter table if exists survey
+    add column if not exists batch_id bigint references survey_batch(id) on delete cascade;
+
+create index if not exists survey_batch_id_idx on survey(batch_id);
+
+-- Summaries
+create table if not exists review_summary
+(
+    id bigserial primary key,
+    batch_id bigint not null references survey_batch(id) on delete cascade,
+    subject_user_id bigint not null references user_info(id) on delete restrict,
+
+    status varchar(16) not null,          -- queued | running | succeeded | failed
+    model_name varchar(128),
+    prompt_version int,
+    summary_text text,
+    stats jsonb,                           -- aggregated numbers, per-question breakdown, etc.
+    error text,
+
+    created_at timestamptz not null,
+    updated_at timestamptz not null,
+    started_at timestamptz,
+    completed_at timestamptz,
+
+    unique (batch_id) -- 1 final summary per batch; relax if you want multiple versions
+);
+create index if not exists review_summary_subject_idx on review_summary(subject_user_id);
+create index if not exists review_summary_status_idx  on review_summary(status);
