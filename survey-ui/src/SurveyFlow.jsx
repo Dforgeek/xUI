@@ -364,10 +364,9 @@ export default function SurveyFlow({
           setCurrent(total - 1);
           setSubmitted(true);
         } else {
-          const startAt = computeStartIndex(blocksWithProfile, mergedAnswers);
-          setVisited(Array.from({ length: total }, (_, i) => i <= startAt));
-          setCurrent(startAt);
-          setSubmitted(false);
+          setVisited(Array.from({ length: total }, (_, i) => i === 0));
+          setCurrent(0);
+          setSubmitted(false)
         }
 
         setMeta((m) => ({
