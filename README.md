@@ -1,6 +1,21 @@
 # xUI
 Кейс хакатона номер 2, оценка 360
 
+## Quick Start
+
+### Frontend
+```
+cd .\survey-ui\
+docker build -t survey-ui .
+docker run --rm -p 5173:80 survey-ui
+```
+
+
+### Backend 
+```
+docker-compose up
+```
+По localhost:8000/docs будет доступен swagger
 
 ### LLM Docker
 Put DeepSeek key in .env file
