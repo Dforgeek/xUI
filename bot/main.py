@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -13,6 +13,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.pdfmetrics import registerFontFamily
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import tempfile
 import os
 from pathlib import Path
@@ -26,7 +27,9 @@ from utils import (
     BTN_CANCEL,
     BTN_REGISTER,
     USERS_FILE,
-    BTN_HR
+    BTN_HR,
+    BTN_LIST_USERS,
+    FRONTEND_BASE
 )
 
 
@@ -69,6 +72,7 @@ def get_chat_id_by_username(username: str) -> Optional[int]:
         if uname and uname.lower() == username.lower():
             return int(chat_id)
     return None
+
 
 
 # =======================
@@ -147,6 +151,77 @@ except Exception as e:
 # =======================
 # Бизнес-логика
 # =======================
+
+async def _build_token_url(token: str) -> str:
+    """Собирает открываемую ссылку для FE. Ваш FE читает ?token=..."""
+    base = FRONTEND_BASE.rstrip("/")
+    # если нужен другой формат (например /access/<token>), поменяйте тут
+    return f"{base}/?token={token}"
+
+async def _load_employees_map() -> Dict[int, int]:
+    """
+    Возвращает map: internal employee id -> telegram_id.
+    Предполагается, что /employees выдаёт объекты с полями {id, telegram_id}.
+    """
+    emps = await http_get("/employees?limit=100&offset=0")
+    mapping: Dict[int, int] = {}
+    for e in emps or []:
+        try:
+            internal_id = int(e.get("id"))
+            tg_id = int(e.get("telegram_id"))
+            mapping[internal_id] = tg_id
+        except Exception:
+            continue
+    return mapping
+
+async def notify_respondents_about_survey(bot: Bot, creation_result: dict) -> Tuple[int, List[str]]:
+    """
+    Отправляет персональные ссылки всем из batch_created.
+    Возвращает (count_sent, errors).
+    Ожидаемый формат creation_result:
+    {
+      "batch_created": [
+        {"surveyId": "srv_1", "respondent_user_id": 6, "linkToken": "..."},
+        ...
+      ],
+      "questions_count": 3
+    }
+    """
+    batch = creation_result.get("batch_created") or []
+    if not batch:
+        return 0, ["batch_created пуст"]
+
+    id2tg = await _load_employees_map()
+    errors: List[str] = []
+    sent = 0
+
+    for item in batch:
+        uid = item.get("respondent_user_id")
+        token = item.get("linkToken")
+        if uid is None or not token:
+            errors.append(f"bad item: {item}")
+            continue
+
+        tg_id = id2tg.get(uid)
+        if not tg_id:
+            errors.append(f"нет telegram_id для respondent_user_id={uid}")
+            continue
+
+        url = await _build_token_url(token)
+        msg = (
+            "Вам назначен новый опрос 360°.\n"
+            f"Перейдите по ссылке и заполните: {url}"
+        )
+        try:
+            await bot.send_message(chat_id=tg_id, text=msg)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            errors.append(f"send to {tg_id} failed: {e}")
+
+    return sent, errors
+
+
 def user_exists(user_id: str) -> bool:
     return user_id in load_users().values()
 
@@ -226,6 +301,25 @@ class HRForm(StatesGroup):
     confirming_send_preset = State()  # подтверждение отправки
 
 
+class SurveyCreateForm(StatesGroup):
+    # существовавшие шаги
+    waiting_subject_user_id = State()
+    waiting_reviewer_user_ids = State()
+    waiting_review_type = State()
+    waiting_question_ids = State()              # может быть пропущен, если создаём блок+вопросы
+    waiting_deadline = State()
+    waiting_notifications_before = State()
+    waiting_anonymous = State()
+    waiting_title = State()
+    confirming = State()
+
+    # НОВОЕ: ветка блок → вопросы → пресет
+    waiting_block_decision = State()            # «Создать новый блок и вопросы?» Да/Нет
+    waiting_block_name = State()
+    waiting_new_question_text = State()
+    waiting_new_question_type = State()
+    waiting_new_question_answers = State()
+    waiting_add_more_questions = State()
 # =======================
 # Keyboards
 # =======================
@@ -236,6 +330,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_SUMMARY)],
             [KeyboardButton(text=BTN_REGISTER)],
             [KeyboardButton(text=BTN_HR)],
+            [KeyboardButton(text=BTN_LIST_USERS)],
         ],
         resize_keyboard=True,
     )
@@ -306,6 +401,62 @@ def render_questions_list(questions: List[dict], limit: int = 200) -> str:
     return "\n".join(lines) if lines else "(вопросов нет)"
 
 
+def build_survey_link(token: str, frontend_base: Optional[str] = None) -> str:
+    """
+    Строим ссылку для фронта с параметром ?token=<...>.
+    Твой фронт читает token из query (?token=... или ?t=...), так что этого достаточно.
+    """
+    base = (frontend_base or FRONTEND_BASE).strip()
+    parts = list(urlsplit(base))
+    # сохраним уже имеющиеся query-параметры, если есть
+    q = dict(parse_qsl(parts[3]))
+    q["token"] = token
+    parts[3] = urlencode(q)
+    return urlunsplit(parts)
+
+
+def _parse_int(text: str) -> Optional[int]:
+    try:
+        return int(text.strip())
+    except Exception:
+        return None
+
+def _parse_int_list(text: str) -> Optional[List[int]]:
+    try:
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if not parts:
+            return []
+        out = []
+        for p in parts:
+            if not p.isdigit():
+                return None
+            out.append(int(p))
+        return out
+    except Exception:
+        return None
+
+def _parse_bool_ru(text: str) -> Optional[bool]:
+    t = text.strip().lower()
+    if t in ("да", "true", "1", "y", "yes"):
+        return True
+    if t in ("нет", "false", "0", "n", "no"):
+        return False
+    return None
+
+def _is_iso_datetime(text: str) -> bool:
+    # ожидаем ISO вида 2025-09-12T00:54:33.189Z
+    try:
+        from datetime import datetime
+        if text.endswith("Z"):
+            datetime.fromisoformat(text[:-1])
+            return True
+        datetime.fromisoformat(text)  # допустим и без Z
+        return True
+    except Exception:
+        return False
+
+
+
 # =======================
 # Handlers: старт/основные (unchanged)
 # =======================
@@ -314,14 +465,9 @@ async def cmd_start(message: types.Message):
     await message.answer("Выберите действие:", reply_markup=main_menu_kb())
 
 
-async def start_create_poll(message: types.Message, state: FSMContext):
-    await state.set_state(Form.waiting_user_id_for_poll)
-    await message.answer(
-        "Введите идентификатор пользователя для создания опроса:",
-        reply_markup=cancel_kb(),
-    )
-
-
+# =======================
+# Создание опроса (новый мастёр)
+# =======================
 async def start_summary(message: types.Message, state: FSMContext):
     await state.set_state(Form.waiting_user_id_for_summary)
     await message.answer(
@@ -329,12 +475,287 @@ async def start_summary(message: types.Message, state: FSMContext):
     )
 
 
-async def start_registration(message: types.Message, state: FSMContext):
+async def start_registration(message: types.Message, state: FSMContext): 
     await state.set_state(Form.waiting_file_for_registration)
+    await message.answer( "Отправьте Excel-файл (.xlsx) с колонками: username, ФИО, email. Username — без ведущего @.", reply_markup=cancel_kb(), )
+
+
+async def start_create_poll(message: types.Message, state: FSMContext):
+    await state.set_state(SurveyCreateForm.waiting_subject_user_id)
     await message.answer(
-        "Отправьте Excel-файл (.xlsx) с колонками: username, ФИО, email. Username — без ведущего @.",
+        "Создаём опрос.\nШаг 1/8 — введите внутренний id оцениваемого (subject_user_id).",
         reply_markup=cancel_kb(),
     )
+
+async def sc_subject_user_id(message: types.Message, state: FSMContext):
+    val = _parse_int(message.text)
+    if val is None:
+        await message.answer("Нужно целое число. Введите subject_user_id ещё раз.")
+        return
+    await state.update_data(subject_user_id=val)
+    await state.set_state(SurveyCreateForm.waiting_reviewer_user_ids)
+    await message.answer("Шаг 2/8 — введите id ревьюеров через запятую (например: 2,3,5).")
+
+async def sc_reviewer_user_ids(message: types.Message, state: FSMContext):
+    vals = _parse_int_list(message.text)
+    if vals is None or not vals:
+        await message.answer("Список должен быть целыми числами через запятую (минимум один).")
+        return
+    await state.update_data(reviewer_user_ids=vals)
+    await state.set_state(SurveyCreateForm.waiting_review_type)
+    await message.answer("Шаг 3/8 — тип обзора (review_type): 180 или 360.")
+
+async def sc_review_type(message: types.Message, state: FSMContext):
+    t = message.text.strip()
+    if t not in ("180", "360"):
+        await message.answer("Поддерживаются только 180 или 360. Введите ещё раз.")
+        return
+    await state.update_data(review_type=t)
+
+    # НОВОЕ: спросить — создать блок и вопросы сейчас?
+    await state.set_state(SurveyCreateForm.waiting_block_decision)
+    await message.answer(
+        "Хотите сразу создать новый блок и вопросы для него? (Да/Нет)\n"
+        "Если «Нет», вы введёте готовые question_id вручную.",
+        reply_markup=cancel_kb(),
+    )
+
+async def sc_block_decision(message: types.Message, state: FSMContext):
+    b = _parse_bool_ru(message.text)
+    if b is None:
+        await message.answer("Ответьте «Да» или «Нет».")
+        return
+    if b:
+        # Создаём новый блок
+        await state.set_state(SurveyCreateForm.waiting_block_name)
+        await message.answer("Введите имя блока (block_name):", reply_markup=cancel_kb())
+    else:
+        # Старый путь: ручной ввод question_ids
+        await state.set_state(SurveyCreateForm.waiting_question_ids)
+        await message.answer(
+            "Шаг 4/8 — введите id вопросов через запятую (пример: 1,4,7).",
+            reply_markup=cancel_kb(),
+        )
+
+async def sc_block_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    if not name:
+        await message.answer("Имя блока не может быть пустым. Введите ещё раз.")
+        return
+    try:
+        created_block = await http_post("/blocks", {"block_name": name})
+        block_id = created_block.get("id")
+        if block_id is None:
+            raise RuntimeError(f"Некорректный ответ /blocks: {created_block}")
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"Не удалось создать блок: {e}", reply_markup=main_menu_kb())
+        return
+
+    await state.update_data(block_id=block_id, new_question_ids=[])
+    await state.set_state(SurveyCreateForm.waiting_new_question_text)
+    await message.answer(
+        f"Блок создан (id={block_id}). Теперь создадим вопросы.\n"
+        "Введите текст первого вопроса:",
+        reply_markup=cancel_kb(),
+    )
+
+async def sc_new_question_text(message: types.Message, state: FSMContext):
+    qtext = message.text.strip()
+    if not qtext:
+        await message.answer("Текст вопроса не может быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(tmp_qtext=qtext)
+    await state.set_state(SurveyCreateForm.waiting_new_question_type)
+    await message.answer("Введите тип вопроса ('0' для текста и '1' для шкалы от 0 до 10):")
+
+async def sc_new_question_type(message: types.Message, state: FSMContext):
+    t = _parse_int(message.text)
+    if t is None:
+        await message.answer("Тип должен быть целым числом. Введите ещё раз.")
+        return
+    await state.update_data(tmp_qtype=t)
+    await state.set_state(SurveyCreateForm.waiting_new_question_answers)
+    await message.answer("Введите answer_fields (строка; как требует ваш API):")
+
+async def sc_new_question_answers(message: types.Message, state: FSMContext):
+    answers = message.text.strip()
+    data = await state.get_data()
+    block_id = data.get("block_id")
+    qtext = data.get("tmp_qtext")
+    qtype = data.get("tmp_qtype")
+    if block_id is None or qtext is None or qtype is None:
+        await state.clear()
+        await message.answer("Внутренняя ошибка состояния. Начните заново.", reply_markup=main_menu_kb())
+        return
+
+    payload = {
+        "block_id": block_id,
+        "question_text": qtext,
+        "question_type": qtype,
+        "answer_fields": answers,
+    }
+    try:
+        created_q = await http_post("/questions", payload)
+        qid = created_q.get("id")
+        if qid is None:
+            raise RuntimeError(f"Некорректный ответ /questions: {created_q}")
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"Не удалось создать вопрос: {e}", reply_markup=main_menu_kb())
+        return
+
+    # добавляем id вопроса в список
+    qids = data.get("new_question_ids", [])
+    qids.append(qid)
+    await state.update_data(new_question_ids=qids, tmp_qtext=None, tmp_qtype=None)
+
+    # спросим — добавить ещё вопрос?
+    await state.set_state(SurveyCreateForm.waiting_add_more_questions)
+    await message.answer(
+        f"Вопрос создан (id={qid}). Добавить ещё вопрос? (Да/Нет)",
+        reply_markup=cancel_kb(),
+    )
+
+async def sc_add_more_questions(message: types.Message, state: FSMContext):
+    b = _parse_bool_ru(message.text)
+    if b is None:
+        await message.answer("Ответьте «Да» или «Нет».")
+        return
+    if b:
+        # новый вопрос в том же блоке
+        await state.set_state(SurveyCreateForm.waiting_new_question_text)
+        await message.answer("Введите текст следующего вопроса:", reply_markup=cancel_kb())
+        return
+
+    # Нет — закрываем набор вопросов, создаём пресет
+    data = await state.get_data()
+    qids = data.get("new_question_ids", [])
+    if not qids:
+        await state.clear()
+        await message.answer("Нужно создать хотя бы один вопрос. Мастер завершён.", reply_markup=main_menu_kb())
+        return
+
+    try:
+        created_preset = await http_post("/presets", {"questions": qids})
+        preset_id = created_preset.get("id")
+        if preset_id is None:
+            raise RuntimeError(f"Некорректный ответ /presets: {created_preset}")
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"Не удалось создать пресет: {e}", reply_markup=main_menu_kb())
+        return
+
+    # Для мастера опроса нам нужны question_ids — используем только что созданные
+    await state.update_data(question_ids=qids, created_preset_id=preset_id)
+    # Идём дальше как будто пользователь ввёл question_ids
+    await state.set_state(SurveyCreateForm.waiting_deadline)
+    await message.answer(
+        f"Пресет создан (id={preset_id}). Вопросы: {', '.join(map(str, qids))}\n"
+        "Шаг 5/8 — дедлайн (deadline) в ISO-формате, напр.: 2025-09-12T00:54:33.189Z",
+        reply_markup=cancel_kb(),
+    )
+
+
+async def sc_question_ids(message: types.Message, state: FSMContext):
+    vals = _parse_int_list(message.text)
+    if vals is None or not vals:
+        await message.answer("Нужен непустой список id вопросов через запятую. Повторите ввод.")
+        return
+    await state.update_data(question_ids=vals)
+    await state.set_state(SurveyCreateForm.waiting_deadline)
+    await message.answer("Шаг 5/8 — дедлайн (ISO), напр.: 2025-09-12T00:54:33.189Z")
+
+async def sc_deadline(message: types.Message, state: FSMContext):
+    s = message.text.strip()
+    if not _is_iso_datetime(s):
+        await message.answer("Неверный формат. Введите ISO-дату, напр.: 2025-09-12T00:54:33.189Z")
+        return
+    await state.update_data(deadline=s)
+    await state.set_state(SurveyCreateForm.waiting_notifications_before)
+    await message.answer("Шаг 6/8 — notifications_before (целое число, 0 если не нужно).")
+
+async def sc_notifications_before(message: types.Message, state: FSMContext):
+    n = _parse_int(message.text)
+    if n is None or n < 0:
+        await message.answer("Нужно целое число ≥ 0. Введите ещё раз.")
+        return
+    await state.update_data(notifications_before=n)
+    await state.set_state(SurveyCreateForm.waiting_anonymous)
+    await message.answer("Шаг 7/8 — анонимный опрос? (Да/Нет)")
+
+async def sc_anonymous(message: types.Message, state: FSMContext):
+    b = _parse_bool_ru(message.text)
+    if b is None:
+        await message.answer("Ответьте «Да» или «Нет».")
+        return
+    await state.update_data(anonymous=b)
+    await state.set_state(SurveyCreateForm.waiting_title)
+    await message.answer("Шаг 8/8 — укажите заголовок опроса (title):")
+
+async def sc_title(message: types.Message, state: FSMContext):
+    title = message.text.strip()
+    if not title:
+        await message.answer("Заголовок не может быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(title=title)
+    data = await state.get_data()
+    preview = (
+        "Проверьте данные перед созданием:\n"
+        f"- subject_user_id: {data['subject_user_id']}\n"
+        f"- reviewer_user_ids: {', '.join(map(str, data['reviewer_user_ids']))}\n"
+        f"- review_type: {data['review_type']}\n"
+        f"- question_ids: {', '.join(map(str, data['question_ids']))}\n"
+        f"- deadline: {data['deadline']}\n"
+        f"- notifications_before: {data['notifications_before']}\n"
+        f"- anonymous: {'Да' if data['anonymous'] else 'Нет'}\n"
+        f"- title: {data['title']}\n\n"
+        "Нажмите «Создать опрос» для отправки или «Отмена»."
+    )
+    await state.set_state(SurveyCreateForm.confirming)
+    await message.answer(preview, reply_markup=simple_kb("Создать опрос", BTN_CANCEL))
+
+async def sc_confirm(message: types.Message, state: FSMContext):
+    if message.text.strip() != "Создать опрос":
+        await message.answer("Нажмите «Создать опрос» или «Отмена».")
+        return
+
+    data = await state.get_data()
+    payload = {
+        "subject_user_id": data["subject_user_id"],
+        "reviewer_user_ids": data["reviewer_user_ids"],
+        "review_type": data["review_type"],
+        "question_ids": data["question_ids"],
+        "deadline": data["deadline"],
+        "notifications_before": data["notifications_before"],
+        "anonymous": data["anonymous"],
+        "title": data["title"],
+    }
+
+    try:
+        created = await http_post("/v1/surveys/initiate", payload)
+        sent, errs = await notify_respondents_about_survey(message.bot, created)
+
+    except Exception as e:
+        await state.clear()
+        await message.answer(
+            f"Ошибка при создании опроса: {e}", reply_markup=main_menu_kb()
+        )
+        return
+
+    await state.clear()
+
+    # Итоговый отчёт
+    report_lines = [
+        "Опрос создан успешно.",
+        # f"Ответ сервера: {created}",
+        f"Оповещений отправлено: {sent}",
+    ]
+    if errs:
+        report_lines.append("Замечания/ошибки при рассылке:")
+        report_lines.extend(f"- {x}" for x in errs[:50])
+    await message.answer("\n".join(report_lines), reply_markup=main_menu_kb())
+
 
 
 async def cancel_handler(message: types.Message, state: FSMContext):
@@ -384,22 +805,149 @@ async def handle_user_id_for_summary(message: types.Message, state: FSMContext):
         pass
 
 
-# =======================
-# Регистрация Excel (unchanged)
-# =======================
+async def show_registered_users(message: types.Message):
+    """
+    Показывает список зарегистрированных пользователей: 'ФИО, id'.
+    Берёт данные из /employees?limit=100&offset=0
+    """
+    try:
+        employees = await http_get("/employees?limit=100&offset=0")
+        if not employees:
+            await message.answer("Пока нет зарегистрированных пользователей.")
+            return
+    except Exception as e:
+        await message.answer(f"Не удалось получить список пользователей: {e}")
+        return
+
+    lines: List[str] = []
+    for emp in employees:
+        first = (emp.get("first_name") or "").strip()
+        last = (emp.get("last_name") or "").strip()
+        fio = (f"{last} {first}").strip()
+        if not fio:
+            # Фолбэк если нет ФИО: используем username/email/telegram_id
+            fio = emp.get("telegram") or emp.get("email") or str(emp.get("telegram_id") or "")
+            fio = fio or "(без имени)"
+        emp_id = emp.get("id")
+        lines.append(f"{fio}, {emp_id}")
+
+    # Telegram ограничение ~4096 символов — разобьём вывод на части
+    chunk = []
+    size = 0
+    for line in lines:
+        if size + len(line) + 1 > 3500:
+            await message.answer("\n".join(chunk))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        await message.answer("\n".join(chunk))
+
+
+async def fetch_employee_telegram_id(employee_id: int, api_base: Optional[str] = None) -> Optional[int]:
+    """
+    Достаём Telegram ID респондента из твоего API.
+    В примере нет фильтра по id, поэтому берём страницу и ищем локально.
+    Если у тебя уже есть готовая функция — просто замени вызов этой функции на неё.
+    """
+    base = (api_base or API_BASE).rstrip("/")
+    url = f"{base}/employees?limit=100&offset=0"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers={"accept": "application/json"}) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    # Ожидаем, что вернётся список сотрудников, каждый — словарь с полями как минимум id + одно из telegram_* полей
+    # Подстраховка по нескольким возможным названиям поля телеграма
+    candidates = data if isinstance(data, list) else data.get("items") or data.get("employees") or []
+    for emp in candidates:
+        try:
+            if int(emp.get("id")) == int(employee_id):
+                tg_id = (
+                    emp.get("telegram_id")
+                    or emp.get("tg_id")
+                    or emp.get("telegramId")
+                    or emp.get("telegram")
+                    or emp.get("chat_id")
+                )
+                # приведём к int, если это строка
+                return int(tg_id) if tg_id is not None else None
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+async def expand_and_format_message(batch_item: Dict[str, Any]) -> tuple[int, str]:
+    """
+    Возвращает (tg_chat_id, text) для отправки.
+    batch_item: {"surveyId":"srv_1","respondent_user_id":6,"linkToken":"..."}
+    """
+    link = build_survey_link(batch_item["linkToken"])
+    tg_id = await fetch_employee_telegram_id(int(batch_item["respondent_user_id"]))
+    if tg_id is None:
+        raise RuntimeError(
+            f"Не найден Telegram ID у пользователя id={batch_item['respondent_user_id']}"
+        )
+
+    text = (
+        "Вам назначен опрос 360°.\n"
+        "Перейдите по ссылке и заполните форму:\n"
+        f"{link}\n\n"
+        "Если ссылка не открывается, попробуйте другой браузер."
+    )
+    return tg_id, text
+
+
+
+async def notify_respondent_about_survey(batch_item: Dict[str, Any]) -> None:
+    """
+    batch_item ожидается в формате:
+    {
+      "surveyId": "srv_1",
+      "respondent_user_id": 6,
+      "linkToken": "fmAbCkoB0uTIuJckaTJoBmMvPJFf-Au-"
+    }
+    """
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан в окружении")
+
+    link_token = batch_item["linkToken"]
+    respondent_id = int(batch_item["respondent_user_id"])
+
+    # 1) Собираем ссылку для фронта
+    link = build_survey_link(link_token)
+
+    # 2) Находим Telegram ID респондента
+    tg_id = await fetch_employee_telegram_id(respondent_id)
+    if tg_id is None:
+        raise RuntimeError(f"Не найден Telegram ID у пользователя id={respondent_id}")
+
+    # 3) Шлём сообщение
+    text = (
+        "Вам назначен опрос 360°.\n"
+        "Перейдите по ссылке и заполните форму:\n"
+        f"{link}\n\n"
+        "Если ссылка не открывается, попробуйте из другого браузера."
+    )
+
+    bot = Bot(token=BOT_TOKEN)
+    try:
+        await bot.send_message(chat_id=tg_id, text=text, disable_web_page_preview=True)
+    except TelegramAPIError as e:
+        raise RuntimeError(f"Ошибка отправки сообщения в Telegram: {e!s}")
+    finally:
+        await bot.session.close()
+
+
 async def handle_registration_file(message: types.Message, state: FSMContext):
     if not message.document:
-        await message.answer(
-            "Пожалуйста, отправьте файл в формате .xlsx.", reply_markup=cancel_kb()
-        )
+        await message.answer("Пожалуйста, отправьте файл в формате .xlsx.", reply_markup=cancel_kb())
         return
 
     file_name = message.document.file_name or "file"
     if not (file_name.lower().endswith(".xlsx") or file_name.lower().endswith(".xls")):
-        await message.answer(
-            "Файл должен быть Excel (.xlsx или .xls). Попробуйте снова.",
-            reply_markup=cancel_kb(),
-        )
+        await message.answer("Файл должен быть Excel (.xlsx или .xls). Попробуйте снова.", reply_markup=cancel_kb())
         return
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix)
@@ -408,13 +956,12 @@ async def handle_registration_file(message: types.Message, state: FSMContext):
 
     bot: Bot = message.bot
 
-    # --- скачивание файла (поддержка разных версий aiogram) ---
+    # --- скачивание файла ---
     try:
         download = getattr(message.document, "download", None)
         if callable(download):
             await message.document.download(destination_file=tmp_path)
         else:
-            # fallback: get_file + прямой запрос к Telegram file API
             file_obj = await bot.get_file(message.document.file_id)
             file_path = file_obj.file_path
             download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
@@ -425,9 +972,7 @@ async def handle_registration_file(message: types.Message, state: FSMContext):
             await asyncio.get_event_loop().run_in_executor(None, _download_sync)
     except Exception as e:
         await state.clear()
-        await message.answer(
-            f"Не удалось скачать файл: {e}", reply_markup=main_menu_kb()
-        )
+        await message.answer(f"Не удалось скачать файл: {e}", reply_markup=main_menu_kb())
         try:
             os.remove(tmp_path)
         except OSError:
@@ -440,22 +985,19 @@ async def handle_registration_file(message: types.Message, state: FSMContext):
         df = pd.read_excel(tmp_path, engine="openpyxl")
     except Exception as e:
         await state.clear()
-        await message.answer(
-            f"Не удалось прочитать Excel: {e}", reply_markup=main_menu_kb()
-        )
+        await message.answer(f"Не удалось прочитать Excel: {e}", reply_markup=main_menu_kb())
         try:
             os.remove(tmp_path)
         except OSError:
             pass
         return
 
-    # удаляем временный xlsx
     try:
         os.remove(tmp_path)
     except OSError:
         pass
 
-    # Нормализация колонок (ищем username, ФИО (fio), email)
+    # Нормализация колонок
     col_map = {}
     for col in df.columns:
         low = str(col).strip().lower()
@@ -468,61 +1010,70 @@ async def handle_registration_file(message: types.Message, state: FSMContext):
 
     if "username" not in col_map:
         await state.clear()
-        await message.answer(
-            "В файле отсутствует колонка 'username'. Убедитесь, что она есть и попробуйте снова.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("В файле отсутствует колонка 'username'. Убедитесь, что она есть и попробуйте снова.", reply_markup=main_menu_kb())
         return
 
-    # Подготовка рассылки
-    send_template = "привет, {fio}!"  # можно менять; {fio} заменится если есть
+    send_template = "привет, {fio}!"  # можно менять
     successes = []
     failures = {}
 
-    # Проходим по строкам
-    for idx, row in df.iterrows():
-        raw_username = row[col_map["username"]]
-        if pd.isna(raw_username):
-            failures[f"row_{idx}"] = "username пустой"
-            continue
-        username = str(raw_username).strip()
-        if username.startswith("@"):
-            username = username[1:]
-        if not username:
-            failures[f"row_{idx}"] = "username оказался пустым после очистки"
-            continue
+    async with aiohttp.ClientSession() as session:
+        for idx, row in df.iterrows():
+            raw_username = row[col_map["username"]]
+            if pd.isna(raw_username):
+                failures[f"row_{idx}"] = "username пустой"
+                continue
 
-        # формируем персонализованный текст, если есть ФИО
-        fio_val = None
-        if "fio" in col_map:
-            raw_fio = row[col_map["fio"]]
-            if not pd.isna(raw_fio):
-                fio_val = str(raw_fio).strip()
-        if fio_val:
-            send_text = send_template.format(fio=fio_val)
-        else:
-            send_text = "привет мир"
+            username = str(raw_username).strip().lstrip("@")
+            if not username:
+                failures[f"row_{idx}"] = "username оказался пустым после очистки"
+                continue
 
-        # Попытка разрешить username -> chat (get_chat может вернуть chat.id)
-        chat_id = get_chat_id_by_username(username)
+            # ФИО
+            fio_val = str(row[col_map["fio"]]).strip() if "fio" in col_map else ""
+            parts = fio_val.split(" ", 1) if fio_val else []
+            last_name = parts[0] if parts else ""
+            first_name = parts[1] if len(parts) > 1 else ""
 
-        if chat_id is None:
-            failures[username] = (
-                "user not found in local db (он не нажимал /start у бота)"
-            )
-            continue
+            email_val = str(row[col_map["email"]]).strip() if "email" in col_map else None
 
-        # Если получили numeric chat_id — пробуем отправить
-        try:
-            await bot.send_message(chat_id=chat_id, text=send_text)
+            chat_id = get_chat_id_by_username(username)
+            if chat_id is None:
+                failures[username] = "user not found in local db (он не нажимал /start у бота)"
+                continue
+
+            send_text = send_template.format(fio=fio_val) if fio_val else "привет мир"
+            try:
+                await bot.send_message(chat_id=chat_id, text=send_text)
+            except TelegramAPIError as e:
+                failures[username] = f"send_message TelegramAPIError: {e}"
+                continue
+            except Exception as e:
+                failures[username] = f"send_message Exception: {e}"
+                continue
+
+            # Формируем JSON для POST
+            payload = {
+                "telegram_id": chat_id,
+                "post": 0,
+                "command_id": 0,
+                "first_name": first_name,
+                "last_name": last_name,
+                "email": email_val,
+                "telegram": username
+            }
+
+            try:
+                async with session.post("http://localhost:8000/employees", json=payload) as resp:
+                    if resp.status != 201:
+                        failures[username] = f"POST error {resp.status}: {await resp.text()}"
+                        continue
+            except Exception as e:
+                failures[username] = f"POST exception: {e}"
+                continue
+
             successes.append(username)
-        except TelegramAPIError as e:
-            failures[username] = f"send_message TelegramAPIError: {e}"
-        except Exception as e:
-            failures[username] = f"send_message Exception: {e}"
-
-        # Небольшая задержка, чтобы не перегружать API (можно уменьшить/увеличить при необходимости)
-        await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
 
     # Формируем отчёт
     total = len(successes) + len(failures)
@@ -532,9 +1083,7 @@ async def handle_registration_file(message: types.Message, state: FSMContext):
         f"Ошибок: {len(failures)}",
     ]
     if successes:
-        report_lines.append(
-            "Успешные username (первые 50): " + ", ".join(successes[:50])
-        )
+        report_lines.append("Успешные username (первые 50): " + ", ".join(successes[:50]))
     if failures:
         report_lines.append("Ошибки (username -> причина):")
         for u, reason in list(failures.items())[:50]:
@@ -542,6 +1091,7 @@ async def handle_registration_file(message: types.Message, state: FSMContext):
 
     await state.clear()
     await message.answer("\n".join(report_lines), reply_markup=main_menu_kb())
+
 
 
 # =======================
@@ -968,12 +1518,31 @@ async def main():
     dp.message.register(start_summary, F.text == BTN_SUMMARY)
     dp.message.register(start_registration, F.text == BTN_REGISTER)
     dp.message.register(cancel_handler, F.text == BTN_CANCEL)
+    dp.message.register(show_registered_users, F.text == BTN_LIST_USERS)
+
 
     # HR navigation entry button
     dp.message.register(hr_start_presets, F.text == BTN_HR)
 
     # Обработка ввода ID по состояниям
-    dp.message.register(handle_user_id_for_poll, Form.waiting_user_id_for_poll)
+    dp.message.register(sc_subject_user_id, SurveyCreateForm.waiting_subject_user_id)
+    dp.message.register(sc_reviewer_user_ids, SurveyCreateForm.waiting_reviewer_user_ids)
+    dp.message.register(sc_review_type, SurveyCreateForm.waiting_review_type)
+    dp.message.register(sc_question_ids, SurveyCreateForm.waiting_question_ids)
+    dp.message.register(sc_deadline, SurveyCreateForm.waiting_deadline)
+    dp.message.register(sc_notifications_before, SurveyCreateForm.waiting_notifications_before)
+    dp.message.register(sc_anonymous, SurveyCreateForm.waiting_anonymous)
+    dp.message.register(sc_title, SurveyCreateForm.waiting_title)
+    dp.message.register(sc_confirm, SurveyCreateForm.confirming)
+
+    # === Ветка блок → вопросы → пресет (как у тебя уже есть) ===
+    dp.message.register(sc_block_decision, SurveyCreateForm.waiting_block_decision)
+    dp.message.register(sc_block_name, SurveyCreateForm.waiting_block_name)
+    dp.message.register(sc_new_question_text, SurveyCreateForm.waiting_new_question_text)
+    dp.message.register(sc_new_question_type, SurveyCreateForm.waiting_new_question_type)
+    dp.message.register(sc_new_question_answers, SurveyCreateForm.waiting_new_question_answers)
+    dp.message.register(sc_add_more_questions, SurveyCreateForm.waiting_add_more_questions)
+
     dp.message.register(handle_user_id_for_summary, Form.waiting_user_id_for_summary)
 
     # Обработчик загрузки Excel при регистрации пользователей

@@ -82,12 +82,15 @@ async def _batch_progress(db: AsyncSession, batch_id: int) -> BatchProgressOut:
         raise HTTPException(404, "Batch not found")
 
     expected = int(batch.expected_respondents)
+    table = ReviewSummary.metadata.tables.get("survey_response")  # -> Table | None
+    select_from_obj = table if table is not None else Survey  # ORM сущность тоже ок
+
 
     responses = await db.scalar(
         select(func.count())
-        .select_from(ReviewSummary.metadata.tables.get("survey_response") or Survey)  # fallback
+        .select_from(select_from_obj)  # fallback
         .select_from(Survey)
-        .join_from(Survey, ReviewSummary.metadata.tables.get("survey_response") or Survey, and_(False))  # no-op in PyCharm
+        .join_from(Survey, select_from_obj, and_(False))  # no-op in PyCharm
     )
     # The above is just to placate static tools; real query below:
     responses = await db.scalar(

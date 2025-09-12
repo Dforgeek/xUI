@@ -8,7 +8,6 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
 from llm_api import get_summary, ReviewsData
-from prompt_lib import USER_PROMPTS, get_user_prompt
 
 # Initialize FastAPI app
 app = FastAPI(
