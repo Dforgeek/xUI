@@ -86,6 +86,13 @@ async def _batch_progress(db: AsyncSession, batch_id: int) -> BatchProgressOut:
     select_from_obj = table if table is not None else Survey  # ORM сущность тоже ок
 
 
+    # Use the raw survey_response table from metadata (defined in frontend_api)
+    resp_table = ReviewSummary.__table__.metadata.tables.get("survey_response")
+    if resp_table is None:
+        # If you renamed the table, adjust the name here
+        raise HTTPException(500, "survey_response table not found in metadata")
+
+    # Count responses for surveys in this batch
     responses = await db.scalar(
         select(func.count())
         .select_from(select_from_obj)  # fallback
@@ -100,9 +107,9 @@ async def _batch_progress(db: AsyncSession, batch_id: int) -> BatchProgressOut:
                    Survey.id == ReviewSummary.__table__.metadata.tables["survey_response"].c.survey_id)
         .where(Survey.batch_id == batch_id)
     )
-
     responses = int(responses or 0)
-    now = _now()
+
+    now = datetime.now(timezone.utc)
     all_responded = responses >= expected
     deadline_passed = now > batch.deadline
     ready = all_responded or deadline_passed
@@ -117,6 +124,7 @@ async def _batch_progress(db: AsyncSession, batch_id: int) -> BatchProgressOut:
         deadlinePassed=deadline_passed,
         readyToSummarize=ready,
     )
+
 
 async def _ensure_summary_row(db: AsyncSession, batch_id: int) -> ReviewSummary:
     existing = await db.scalar(select(ReviewSummary).where(ReviewSummary.batch_id == batch_id))
